@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir \
 RUN apk add --no-cache rclone
 
 
-FROM python:3.11.9-alpine AS runtime
+FROM python:3.11.9-alpine AS runtime-image
 
 WORKDIR /app
 

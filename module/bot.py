@@ -851,7 +851,7 @@ async def remove_replace_advertisement_filter(
 
 
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
-_FILES_PER_PAGE = 8
+_FILES_PER_PAGE = 9
 
 
 def _download_root() -> str:
@@ -881,40 +881,94 @@ def _list_browser_entries(relative_dir: str) -> list:
     return sorted(entries, key=lambda item: (not item.is_dir(), item.name.lower()))
 
 
+def _browser_breadcrumb(relative_dir: str) -> str:
+    """Format a compact, user-facing path without exposing numeric chat IDs."""
+    if not relative_dir:
+        return "下载目录"
+    parts = [part for part in relative_dir.split(os.sep) if part and part != "."]
+    labels = ["个人转发" if part.isdigit() else part for part in parts]
+    return " › ".join(labels)
+
+
+def _browser_button_label(entry, number: int) -> str:
+    """Return a compact label suitable for a three-column keyboard."""
+    if entry.is_dir():
+        return f"📁 {entry.name[:14]}"
+    stem, suffix = os.path.splitext(entry.name)
+    if suffix.lower() in _VIDEO_SUFFIXES:
+        return f"🎬 {number:02d} {stem[:10]}…"
+    return f"📄 {entry.name[:14]}"
+
+
 async def _render_file_browser(
     client: pyrogram.Client, state: FileBrowserState, message_id: int = 0
 ):
-    """Render one callback-safe, paginated directory page."""
+    """Render a compact 3x3, callback-safe directory browser."""
     entries = _list_browser_entries(state.relative_dir)
     total_pages = max(1, (len(entries) + _FILES_PER_PAGE - 1) // _FILES_PER_PAGE)
     state.page = max(0, min(state.page, total_pages - 1))
     start = state.page * _FILES_PER_PAGE
     state.entries = entries[start : start + _FILES_PER_PAGE]
-    shown_path = state.relative_dir or "/"
-    text = f"📁 downloads/{shown_path}\n\n共 {len(entries)} 项，第 {state.page + 1}/{total_pages} 页"
-    buttons = []
-    for index, entry in enumerate(state.entries):
-        if entry.is_dir():
-            label = f"📁 {entry.name}"
-            action = "file_dir"
-        else:
-            suffix = os.path.splitext(entry.name)[1].lower()
-            label = f"🎬 {entry.name}" if suffix in _VIDEO_SUFFIXES else f"📄 {entry.name}"
-            action = "file_item"
-        buttons.append([InlineKeyboardButton(label[:60], callback_data=f"{action}:{state.token}:{index}")])
-    navigation = []
-    if state.page:
-        navigation.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"file_page:{state.token}:-1"))
-    if state.page + 1 < total_pages:
-        navigation.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"file_page:{state.token}:1"))
-    if navigation:
-        buttons.append(navigation)
-    if state.relative_dir:
-        buttons.append([InlineKeyboardButton("⬆️ 上级目录", callback_data=f"file_up:{state.token}:0")])
+    text = (
+        f"📁 文件浏览器\n{_browser_breadcrumb(state.relative_dir)}\n"
+        f"共 {len(entries)} 项 · 第 {state.page + 1}/{total_pages} 页"
+    )
 
-    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    buttons = []
+    row = []
+    for index, entry in enumerate(state.entries):
+        action = "file_dir" if entry.is_dir() else "file_item"
+        row.append(
+            InlineKeyboardButton(
+                _browser_button_label(entry, start + index + 1),
+                callback_data=f"{action}:{state.token}:{index}",
+            )
+        )
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    previous = "⬅️ 上一页" if state.page else "·"
+    next_page = "下一页 ➡️" if state.page + 1 < total_pages else "·"
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                previous,
+                callback_data=(
+                    f"file_page:{state.token}:-1" if state.page else f"file_noop:{state.token}:0"
+                ),
+            ),
+            InlineKeyboardButton(
+                f"{state.page + 1}/{total_pages}",
+                callback_data=f"file_noop:{state.token}:0",
+            ),
+            InlineKeyboardButton(
+                next_page,
+                callback_data=(
+                    f"file_page:{state.token}:1"
+                    if state.page + 1 < total_pages
+                    else f"file_noop:{state.token}:0"
+                ),
+            ),
+        ]
+    )
+    if state.relative_dir:
+        buttons.append(
+            [
+                InlineKeyboardButton("⬆️ 上级目录", callback_data=f"file_up:{state.token}:0"),
+                InlineKeyboardButton("🏠 根目录", callback_data=f"file_root:{state.token}:0"),
+            ]
+        )
+    else:
+        buttons.append([InlineKeyboardButton("🔄 刷新", callback_data=f"file_root:{state.token}:0")])
+
+    markup = InlineKeyboardMarkup(buttons)
     if message_id:
-        await client.edit_message_text(state.user_id, message_id, text, reply_markup=markup)
+        await client.edit_message_text(
+            state.user_id, message_id, text, reply_markup=markup
+        )
     else:
         await client.send_message(state.user_id, text, reply_markup=markup)
 
@@ -947,12 +1001,27 @@ async def _show_file_item(
     entry = state.entries[index]
     if entry.is_dir():
         return
-    relative = os.path.relpath(entry.path, _download_root())
     size = os.path.getsize(entry.path)
     is_video = os.path.splitext(entry.name)[1].lower() in _VIDEO_SUFFIXES
-    text = f"{'🎬 视频' if is_video else '📄 文件'}：{entry.name}\n📏 {format_byte(size)}\n📁 {relative}"
+    text = (
+        f"{'🎬 视频' if is_video else '📄 文件'}：{entry.name}\n"
+        f"📏 {format_byte(size)}\n"
+        f"📁 {_browser_breadcrumb(state.relative_dir)}"
+    )
     button = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("▶️ 发送并播放" if is_video else "📤 发送文件", callback_data=f"file_send:{state.token}:{index}")]]
+        [
+            [
+                InlineKeyboardButton(
+                    "▶️ 发送并播放" if is_video else "📤 发送文件",
+                    callback_data=f"file_send:{state.token}:{index}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ 返回文件列表", callback_data=f"file_back:{state.token}:0"
+                )
+            ],
+        ]
     )
     thumbnail = ""
     if is_video:
@@ -1827,12 +1896,20 @@ async def on_query_handler(
             if not state or state.user_id != query.from_user.id:
                 raise ValueError("expired browser")
             await query.answer()
+            if action == "file_noop":
+                return
+            if action == "file_back":
+                await client.delete_messages(query.from_user.id, query.message.id)
+                return
             if action == "file_page":
                 state.page += int(value)
                 await _render_file_browser(client, state, query.message.id)
             elif action == "file_up":
                 parent = os.path.dirname(state.relative_dir)
                 new_state = _new_browser_state(query.from_user.id, parent)
+                await _render_file_browser(client, new_state, query.message.id)
+            elif action == "file_root":
+                new_state = _new_browser_state(query.from_user.id)
                 await _render_file_browser(client, new_state, query.message.id)
             else:
                 index = int(value)

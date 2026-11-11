@@ -995,6 +995,39 @@ def _video_thumbnail(path: str) -> str:
     return thumb if os.path.exists(thumb) else ""
 
 
+def _video_metadata(path: str):
+    """Read dimensions and duration so Telegram keeps the original aspect ratio."""
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,duration",
+            "-of",
+            "default=noprint_wrappers=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    values = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    try:
+        return int(values["width"]), int(values["height"]), int(
+            float(values.get("duration", "0"))
+        )
+    except (KeyError, TypeError, ValueError):
+        return 0, 0, 0
+
+
 async def _show_file_item(
     client: pyrogram.Client, query: pyrogram.types.CallbackQuery, state: FileBrowserState, index: int
 ):
@@ -1046,7 +1079,20 @@ async def _send_browser_file(
     status = await client.send_message(query.from_user.id, f"⏫ 正在上传：{entry.name}")
     try:
         if is_video:
-            await client.send_video(query.from_user.id, entry.path, supports_streaming=True)
+            thumbnail, video_info = await asyncio.gather(
+                _bot.app.loop.run_in_executor(None, _video_thumbnail, entry.path),
+                _bot.app.loop.run_in_executor(None, _video_metadata, entry.path),
+            )
+            width, height, duration = video_info
+            await client.send_video(
+                query.from_user.id,
+                entry.path,
+                thumb=thumbnail or None,
+                width=width or None,
+                height=height or None,
+                duration=duration or None,
+                supports_streaming=True,
+            )
         else:
             await client.send_document(query.from_user.id, entry.path)
         await client.edit_message_text(query.from_user.id, status.id, f"✅ 已发送：{entry.name}")
@@ -1199,9 +1245,25 @@ async def receive_custom_download_folder(
     client: pyrogram.Client, message: pyrogram.types.Message
 ):
     """Accept a folder only when replying to its specific destination prompt."""
-    if not message.reply_to_message:
-        return
-    pending = _bot.pending_prompt_downloads.get(message.reply_to_message.id)
+    pending = None
+    if message.reply_to_message:
+        pending = _bot.pending_prompt_downloads.get(message.reply_to_message.id)
+    else:
+        # Allow a plain folder name as long as this user has only one pending
+        # custom-folder request. Replies are still required when ambiguous.
+        waiting = [
+            value
+            for value in _bot.pending_prompt_downloads.values()
+            if value.user_id == message.from_user.id and value.waiting_custom_path
+        ]
+        if len(waiting) == 1:
+            pending = waiting[0]
+        elif len(waiting) > 1:
+            await client.send_message(
+                message.from_user.id,
+                "你有多个待选择目录的任务，请回复对应的提示消息输入文件夹。",
+            )
+            return
     if not pending or not pending.waiting_custom_path:
         return
     if message.text.strip() == "/cancel":

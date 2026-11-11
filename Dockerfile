@@ -1,4 +1,4 @@
-FROM python:3.11.9-alpine AS build
+FROM python:3.11.9-alpine AS compile-image
 
 WORKDIR /app
 
@@ -21,11 +21,14 @@ FROM python:3.11.9-alpine AS runtime
 
 WORKDIR /app
 
+# ffmpeg is needed at runtime to create local video thumbnails.
+RUN apk add --no-cache ffmpeg
+
 # Copy installed deps from build stage
-COPY --from=build /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=compile-image /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
 # Copy rclone to the path expected by the app (matches code default: ./rclone/rclone)
-COPY --from=build /usr/bin/rclone /app/rclone/rclone
+COPY --from=compile-image /usr/bin/rclone /app/rclone/rclone
 
 # Copy app source code
 COPY . /app

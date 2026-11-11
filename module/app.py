@@ -175,6 +175,10 @@ class TaskNode:
         self.topic_id = topic_id
         self.reply_to_message = None
         self.cloud_drive_upload_stat_dict: dict = {}
+        # A per-task destination selected through the bot.  None preserves the
+        # configured save_path/file_path_prefix behaviour.
+        self.save_path: Optional[str] = None
+        self.progress_message_has_media: bool = False
 
     def skip_msg_id(self, msg_id: int):
         """Skip if message id out of range"""

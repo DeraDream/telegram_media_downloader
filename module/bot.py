@@ -1,7 +1,10 @@
 """Bot for media downloader"""
 
 import asyncio
+import hashlib
 import os
+import subprocess
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, List, Union
 
@@ -37,10 +40,35 @@ from module.pyrogram_extension import (
     set_meta_data,
     upload_telegram_chat_message,
 )
-from utils.format import replace_date_time, validate_title
+from utils.format import format_byte, replace_date_time, validate_title
 from utils.meta_data import MetaData
 
 # pylint: disable = C0301, R0902
+
+
+@dataclass
+class PendingDirectDownload:
+    """Media received from a user while its destination is being selected."""
+
+    token: str
+    key: str
+    user_id: int
+    client: pyrogram.Client
+    messages: list = field(default_factory=list)
+    prompt_message_id: int = 0
+    waiting_custom_path: bool = False
+    collect_task: object = None
+
+
+@dataclass
+class FileBrowserState:
+    """One user's current directory page and its callback-safe entries."""
+
+    token: str
+    user_id: int
+    relative_dir: str
+    page: int = 0
+    entries: list = field(default_factory=list)
 
 
 class DownloadBot:
@@ -70,6 +98,12 @@ class DownloadBot:
         self.download_filter: List[str] = []
         self.task_id: int = 0
         self.reply_task = None
+        self.pending_direct_downloads: dict = {}
+        self.pending_prompt_downloads: dict = {}
+        self.handled_media_groups: dict = {}
+        self.pending_download_seq: int = 0
+        self.file_browser_states: dict = {}
+        self.file_browser_seq: int = 0
 
     def gen_task_id(self) -> int:
         """Gen task id"""
@@ -179,6 +213,7 @@ class DownloadBot:
                 ),
             ),
             types.BotCommand("set_language", _t("Set language")),
+            types.BotCommand("files", "Browse downloaded files"),
             types.BotCommand("stop", _t("Stop bot download or forward")),
         ]
 
@@ -234,6 +269,14 @@ class DownloadBot:
         )
         self.bot.add_handler(
             MessageHandler(
+                receive_custom_download_folder,
+                filters=pyrogram.filters.text
+                & pyrogram.filters.user(self.allowed_user_ids),
+            ),
+            group=1,
+        )
+        self.bot.add_handler(
+            MessageHandler(
                 download_from_link,
                 filters=pyrogram.filters.regex(r"^https://t.me.*")
                 & pyrogram.filters.user(self.allowed_user_ids),
@@ -271,6 +314,13 @@ class DownloadBot:
             MessageHandler(
                 set_language,
                 filters=pyrogram.filters.command(["set_language"])
+                & pyrogram.filters.user(self.allowed_user_ids),
+            )
+        )
+        self.bot.add_handler(
+            MessageHandler(
+                browse_files,
+                filters=pyrogram.filters.command(["files"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
@@ -800,6 +850,316 @@ async def remove_replace_advertisement_filter(
         return
 
 
+_VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
+_FILES_PER_PAGE = 8
+
+
+def _download_root() -> str:
+    return os.path.abspath(_bot.app.save_path)
+
+
+def _browser_path(relative_dir: str) -> str:
+    """Resolve a browser path and keep it confined to the download root."""
+    path = os.path.abspath(os.path.join(_download_root(), relative_dir))
+    if os.path.commonpath([path, _download_root()]) != _download_root():
+        raise ValueError("path outside download directory")
+    return path
+
+
+def _new_browser_state(user_id: int, relative_dir: str = "", page: int = 0):
+    _bot.file_browser_seq += 1
+    state = FileBrowserState(str(_bot.file_browser_seq), user_id, relative_dir, page)
+    _bot.file_browser_states[state.token] = state
+    return state
+
+
+def _list_browser_entries(relative_dir: str) -> list:
+    directory = _browser_path(relative_dir)
+    if not os.path.isdir(directory):
+        return []
+    entries = [entry for entry in os.scandir(directory) if not entry.name.startswith(".")]
+    return sorted(entries, key=lambda item: (not item.is_dir(), item.name.lower()))
+
+
+async def _render_file_browser(
+    client: pyrogram.Client, state: FileBrowserState, message_id: int = 0
+):
+    """Render one callback-safe, paginated directory page."""
+    entries = _list_browser_entries(state.relative_dir)
+    total_pages = max(1, (len(entries) + _FILES_PER_PAGE - 1) // _FILES_PER_PAGE)
+    state.page = max(0, min(state.page, total_pages - 1))
+    start = state.page * _FILES_PER_PAGE
+    state.entries = entries[start : start + _FILES_PER_PAGE]
+    shown_path = state.relative_dir or "/"
+    text = f"📁 downloads/{shown_path}\n\n共 {len(entries)} 项，第 {state.page + 1}/{total_pages} 页"
+    buttons = []
+    for index, entry in enumerate(state.entries):
+        if entry.is_dir():
+            label = f"📁 {entry.name}"
+            action = "file_dir"
+        else:
+            suffix = os.path.splitext(entry.name)[1].lower()
+            label = f"🎬 {entry.name}" if suffix in _VIDEO_SUFFIXES else f"📄 {entry.name}"
+            action = "file_item"
+        buttons.append([InlineKeyboardButton(label[:60], callback_data=f"{action}:{state.token}:{index}")])
+    navigation = []
+    if state.page:
+        navigation.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"file_page:{state.token}:-1"))
+    if state.page + 1 < total_pages:
+        navigation.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"file_page:{state.token}:1"))
+    if navigation:
+        buttons.append(navigation)
+    if state.relative_dir:
+        buttons.append([InlineKeyboardButton("⬆️ 上级目录", callback_data=f"file_up:{state.token}:0")])
+
+    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    if message_id:
+        await client.edit_message_text(state.user_id, message_id, text, reply_markup=markup)
+    else:
+        await client.send_message(state.user_id, text, reply_markup=markup)
+
+
+async def browse_files(client: pyrogram.Client, message: pyrogram.types.Message):
+    """Open a paginated browser rooted at the configured downloads directory."""
+    await _render_file_browser(client, _new_browser_state(message.from_user.id))
+
+
+def _video_thumbnail(path: str) -> str:
+    """Extract and cache one thumbnail; returns an empty string when unavailable."""
+    cache_dir = os.path.join(_bot.app.temp_save_path, "file_browser_thumbnails")
+    os.makedirs(cache_dir, exist_ok=True)
+    thumb = os.path.join(cache_dir, hashlib.sha256(path.encode()).hexdigest() + ".jpg")
+    if os.path.exists(thumb):
+        return thumb
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", "00:00:01", "-i", path, "-frames:v", "1", thumb],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=30,
+    )
+    return thumb if os.path.exists(thumb) else ""
+
+
+async def _show_file_item(
+    client: pyrogram.Client, query: pyrogram.types.CallbackQuery, state: FileBrowserState, index: int
+):
+    entry = state.entries[index]
+    if entry.is_dir():
+        return
+    relative = os.path.relpath(entry.path, _download_root())
+    size = os.path.getsize(entry.path)
+    is_video = os.path.splitext(entry.name)[1].lower() in _VIDEO_SUFFIXES
+    text = f"{'🎬 视频' if is_video else '📄 文件'}：{entry.name}\n📏 {format_byte(size)}\n📁 {relative}"
+    button = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("▶️ 发送并播放" if is_video else "📤 发送文件", callback_data=f"file_send:{state.token}:{index}")]]
+    )
+    thumbnail = ""
+    if is_video:
+        try:
+            thumbnail = await _bot.app.loop.run_in_executor(None, _video_thumbnail, entry.path)
+        except Exception:
+            thumbnail = ""
+    if thumbnail:
+        await client.send_photo(query.from_user.id, thumbnail, caption=text, reply_markup=button)
+    else:
+        await client.send_message(query.from_user.id, text, reply_markup=button)
+
+
+async def _send_browser_file(
+    client: pyrogram.Client, query: pyrogram.types.CallbackQuery, state: FileBrowserState, index: int
+):
+    entry = state.entries[index]
+    if entry.is_dir() or not os.path.isfile(entry.path):
+        await query.answer("文件不存在", show_alert=True)
+        return
+    is_video = os.path.splitext(entry.name)[1].lower() in _VIDEO_SUFFIXES
+    status = await client.send_message(query.from_user.id, f"⏫ 正在上传：{entry.name}")
+    try:
+        if is_video:
+            await client.send_video(query.from_user.id, entry.path, supports_streaming=True)
+        else:
+            await client.send_document(query.from_user.id, entry.path)
+        await client.edit_message_text(query.from_user.id, status.id, f"✅ 已发送：{entry.name}")
+    except Exception as exc:
+        await client.edit_message_text(query.from_user.id, status.id, f"❌ 发送失败：{exc}")
+
+
+def _clean_custom_folder(folder: str) -> str:
+    """Return a safe path below the configured download root."""
+    folder = folder.strip()
+    if not folder or os.path.isabs(folder):
+        raise ValueError("folder must be a non-empty relative path")
+    normalized = os.path.normpath(folder)
+    if normalized in (".", "..") or normalized.startswith(".." + os.sep):
+        raise ValueError("folder must not leave the download directory")
+    if any(part == ".." for part in normalized.replace("\\", "/").split("/")):
+        raise ValueError("folder must not contain '..'")
+    return normalized
+
+
+async def _ask_download_folder(pending: PendingDirectDownload):
+    """Ask where a collected direct-download request should be saved."""
+    if pending.key in _bot.handled_media_groups:
+        return
+
+    # Fetching the album once avoids relying on the arrival order of its updates.
+    first = pending.messages[0]
+    if first.media_group_id:
+        try:
+            album = await pending.client.get_media_group(first.chat.id, first.id)
+            if album:
+                pending.messages = album
+        except Exception:
+            pass
+
+    unique = {item.id: item for item in pending.messages}
+    pending.messages = [unique[key] for key in sorted(unique)]
+    _bot.handled_media_groups[pending.key] = True
+    count = len(pending.messages)
+    prompt = await pending.client.send_message(
+        pending.user_id,
+        f"📦 检测到 {count} 个媒体文件。\n"
+        "请选择保存位置：\n"
+        "默认目录会保持当前频道/日期分类规则；自定义目录会创建在 downloads/ 下。",
+        reply_to_message_id=first.id,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ 默认目录", callback_data=f"dest_default:{pending.token}"
+                    ),
+                    InlineKeyboardButton(
+                        "📁 自定义文件夹", callback_data=f"dest_custom:{pending.token}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ 取消", callback_data=f"dest_cancel:{pending.token}"
+                    )
+                ],
+            ]
+        ),
+    )
+    pending.prompt_message_id = prompt.id
+    _bot.pending_prompt_downloads[prompt.id] = pending
+
+
+async def collect_direct_download(client: pyrogram.Client, message: pyrogram.types.Message):
+    """Collect a forwarded message/album before asking for its destination."""
+    group = message.media_group_id or f"single-{message.id}"
+    key = f"{message.from_user.id}:{group}"
+    if key in _bot.handled_media_groups:
+        return
+
+    pending = _bot.pending_direct_downloads.get(key)
+    if not pending:
+        _bot.pending_download_seq += 1
+        pending = PendingDirectDownload(
+            token=str(_bot.pending_download_seq),
+            key=key,
+            user_id=message.from_user.id,
+            client=client,
+        )
+        _bot.pending_direct_downloads[key] = pending
+    pending.messages.append(message)
+
+    if pending.collect_task:
+        pending.collect_task.cancel()
+
+    async def flush():
+        try:
+            # Album updates normally arrive together; this short debounce groups them.
+            await asyncio.sleep(0.8 if message.media_group_id else 0.1)
+            await _ask_download_folder(pending)
+        except asyncio.CancelledError:
+            return
+        finally:
+            # A newer album update may have replaced this debounce task.
+            if pending.collect_task is asyncio.current_task():
+                _bot.pending_direct_downloads.pop(key, None)
+
+    pending.collect_task = _bot.app.loop.create_task(flush())
+
+
+async def _start_pending_download(pending: PendingDirectDownload, folder: str = None):
+    """Create one task and one progress message for a forwarded batch."""
+    _bot.pending_prompt_downloads.pop(pending.prompt_message_id, None)
+    first = pending.messages[0]
+    initial = "📦 准备下载…"
+    if folder:
+        initial += f"\n📁 保存到：{os.path.relpath(folder, _bot.app.save_path)}"
+
+    progress_message = None
+    thumb_id = None
+    if first.video and first.video.thumbs:
+        thumb_id = first.video.thumbs[0].file_id
+    try:
+        if thumb_id:
+            progress_message = await pending.client.send_photo(
+                pending.user_id,
+                thumb_id,
+                caption=initial,
+                reply_to_message_id=first.id,
+            )
+    except Exception:
+        progress_message = None
+    if not progress_message:
+        progress_message = await pending.client.send_message(
+            pending.user_id, initial, reply_to_message_id=first.id
+        )
+
+    node = TaskNode(
+        chat_id=pending.user_id,
+        from_user_id=pending.user_id,
+        reply_message_id=progress_message.id,
+        replay_message=initial,
+        bot=_bot.bot,
+        task_id=_bot.gen_task_id(),
+    )
+    node.client = pending.client
+    node.save_path = folder
+    node.progress_message_has_media = bool(thumb_id and progress_message.photo)
+    _bot.add_task_node(node)
+    for item in pending.messages:
+        await _bot.add_download_task(item, node)
+    node.is_running = True
+
+
+async def receive_custom_download_folder(
+    client: pyrogram.Client, message: pyrogram.types.Message
+):
+    """Accept a folder only when replying to its specific destination prompt."""
+    if not message.reply_to_message:
+        return
+    pending = _bot.pending_prompt_downloads.get(message.reply_to_message.id)
+    if not pending or not pending.waiting_custom_path:
+        return
+    if message.text.strip() == "/cancel":
+        _bot.pending_prompt_downloads.pop(pending.prompt_message_id, None)
+        await client.edit_message_text(pending.user_id, pending.prompt_message_id, "❌ 已取消下载")
+        return
+    try:
+        relative = _clean_custom_folder(message.text)
+        folder = os.path.abspath(os.path.join(_bot.app.save_path, relative))
+        download_root = os.path.abspath(_bot.app.save_path)
+        if os.path.commonpath([folder, download_root]) != download_root:
+            raise ValueError("folder must be inside downloads")
+        os.makedirs(folder, exist_ok=True)
+    except (ValueError, OSError):
+        await client.send_message(
+            pending.user_id,
+            "文件夹无效。请回复相对路径，例如：课程/Python 第一季；或回复 /cancel。",
+            reply_to_message_id=pending.prompt_message_id,
+        )
+        return
+
+    await client.edit_message_text(
+        pending.user_id, pending.prompt_message_id, f"📁 保存到：{relative}"
+    )
+    await _start_pending_download(pending, folder)
+
+
 async def direct_download(
     download_bot: DownloadBot,
     chat_id: Union[str, int],
@@ -851,7 +1211,7 @@ async def download_forward_media(
     """
 
     if message.media and getattr(message, message.media.value):
-        await direct_download(_bot, message.from_user.id, message, message, client)
+        await collect_direct_download(client, message)
         return
 
     await client.send_message(
@@ -1459,6 +1819,79 @@ async def on_query_handler(
     Returns:
         None
     """
+
+    if query.data.startswith("file_"):
+        try:
+            action, token, value = query.data.split(":", 2)
+            state = _bot.file_browser_states.get(token)
+            if not state or state.user_id != query.from_user.id:
+                raise ValueError("expired browser")
+            await query.answer()
+            if action == "file_page":
+                state.page += int(value)
+                await _render_file_browser(client, state, query.message.id)
+            elif action == "file_up":
+                parent = os.path.dirname(state.relative_dir)
+                new_state = _new_browser_state(query.from_user.id, parent)
+                await _render_file_browser(client, new_state, query.message.id)
+            else:
+                index = int(value)
+                if index < 0 or index >= len(state.entries):
+                    raise ValueError("invalid file index")
+                if action == "file_dir":
+                    entry = state.entries[index]
+                    if not entry.is_dir():
+                        raise ValueError("not a directory")
+                    relative = os.path.relpath(entry.path, _download_root())
+                    new_state = _new_browser_state(query.from_user.id, relative)
+                    await _render_file_browser(client, new_state, query.message.id)
+                elif action == "file_item":
+                    await _show_file_item(client, query, state, index)
+                elif action == "file_send":
+                    await _send_browser_file(client, query, state, index)
+                else:
+                    raise ValueError("unknown browser action")
+        except Exception:
+            await client.send_message(query.from_user.id, "目录已失效或文件不可用，请重新执行 /files。")
+        return
+
+    if query.data.startswith("dest_"):
+        action, token = query.data.split(":", 1)
+        pending = next(
+            (
+                value
+                for value in _bot.pending_prompt_downloads.values()
+                if value.token == token and value.user_id == query.from_user.id
+            ),
+            None,
+        )
+        if not pending:
+            await query.answer("该请求已失效", show_alert=True)
+            return
+        if action == "dest_cancel":
+            _bot.pending_prompt_downloads.pop(pending.prompt_message_id, None)
+            await client.edit_message_text(pending.user_id, pending.prompt_message_id, "❌ 已取消下载")
+            await query.answer()
+            return
+        if action == "dest_custom":
+            pending.waiting_custom_path = True
+            await client.edit_message_text(
+                pending.user_id,
+                pending.prompt_message_id,
+                "请回复此消息输入文件夹名称。\n"
+                "例如：课程/Python 第一季\n"
+                "文件夹会创建在 downloads/ 下；回复 /cancel 可取消。",
+            )
+            await query.answer()
+            return
+        if action == "dest_default":
+            _bot.pending_prompt_downloads.pop(pending.prompt_message_id, None)
+            await client.edit_message_text(
+                pending.user_id, pending.prompt_message_id, "✅ 使用默认目录，开始下载…"
+            )
+            await _start_pending_download(pending)
+            await query.answer()
+            return
 
     for it in QueryHandler:
         queryHandler = QueryHandlerStr.get_str(it.value)

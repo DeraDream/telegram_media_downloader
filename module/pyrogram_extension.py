@@ -1173,12 +1173,20 @@ async def _report_bot_status(
 
         if new_msg_str != node.last_edit_msg:
             node.last_edit_msg = new_msg_str
-            await client.edit_message_text(
-                node.from_user_id,
-                node.reply_message_id,
-                new_msg_str,
-                parse_mode=pyrogram.enums.ParseMode.MARKDOWN,
-            )
+            if node.progress_message_has_media:
+                await client.edit_message_caption(
+                    node.from_user_id,
+                    node.reply_message_id,
+                    new_msg_str,
+                    parse_mode=pyrogram.enums.ParseMode.MARKDOWN,
+                )
+            else:
+                await client.edit_message_text(
+                    node.from_user_id,
+                    node.reply_message_id,
+                    new_msg_str,
+                    parse_mode=pyrogram.enums.ParseMode.MARKDOWN,
+                )
 
 
 def set_max_concurrent_transmissions(

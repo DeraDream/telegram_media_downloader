@@ -170,6 +170,8 @@ class TaskNode:
         self.media_group_ids: dict = {}
         self.media_group_ids_lock: Lock = Lock()
         self.download_status: dict = {}
+        # Keep resolved names so album progress can show every item's state.
+        self.download_file_names: dict = {}
         self.upload_status: dict = {}
         self.upload_stat_dict: dict = {}
         self.topic_id = topic_id

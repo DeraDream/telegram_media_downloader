@@ -1295,15 +1295,41 @@ async def direct_download(
     download_bot: DownloadBot,
     chat_id: Union[str, int],
     message: pyrogram.types.Message,
-    download_message: pyrogram.types.Message,
+    download_message: Union[pyrogram.types.Message, List[pyrogram.types.Message]],
     client: pyrogram.Client = None,
 ):
-    """Direct Download"""
+    """Queue a direct download, including every item in a media album."""
 
-    replay_message = "Direct download..."
-    last_reply_message = await download_bot.bot.send_message(
-        message.from_user.id, replay_message, reply_to_message_id=message.id
-    )
+    unique_messages = {
+        item.id: item
+        for item in (
+            download_message if isinstance(download_message, list) else [download_message]
+        )
+    }
+    download_messages = [unique_messages[key] for key in sorted(unique_messages)]
+    replay_message = f"📦 准备下载 {len(download_messages)} 个媒体文件…"
+
+    # Give link downloads the same thumbnail progress card as forwarded albums.
+    # A bot cannot always reuse a source thumbnail file ID, so fall back to text.
+    last_reply_message = None
+    first = download_messages[0]
+    thumb_id = None
+    if first.video and first.video.thumbs:
+        thumb_id = first.video.thumbs[0].file_id
+    try:
+        if thumb_id:
+            last_reply_message = await download_bot.bot.send_photo(
+                message.from_user.id,
+                thumb_id,
+                caption=replay_message,
+                reply_to_message_id=message.id,
+            )
+    except Exception:
+        pass
+    if not last_reply_message:
+        last_reply_message = await download_bot.bot.send_message(
+            message.from_user.id, replay_message, reply_to_message_id=message.id
+        )
 
     node = TaskNode(
         chat_id=chat_id,
@@ -1316,13 +1342,14 @@ async def direct_download(
     )
 
     node.client = client
+    node.progress_message_has_media = bool(
+        thumb_id and last_reply_message.photo
+    )
 
     _bot.add_task_node(node)
 
-    await _bot.add_download_task(
-        download_message,
-        node,
-    )
+    for item in download_messages:
+        await _bot.add_download_task(item, node)
 
     node.is_running = True
 
@@ -1389,7 +1416,17 @@ async def download_from_link(client: pyrogram.Client, message: pyrogram.types.Me
                 _bot.client.get_messages, args=(chat_id, message_id)
             )
             if download_message:
-                await direct_download(_bot, entity.id, message, download_message)
+                download_messages = [download_message]
+                if download_message.media_group_id:
+                    try:
+                        album = await _bot.client.get_media_group(
+                            entity.id, download_message.id
+                        )
+                        if album:
+                            download_messages = album
+                    except Exception as exc:
+                        logger.warning("Unable to fetch media album: {}", exc)
+                await direct_download(_bot, entity.id, message, download_messages)
             else:
                 client.send_message(
                     message.from_user.id,

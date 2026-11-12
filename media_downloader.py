@@ -273,8 +273,10 @@ async def add_download_task(
     if message.empty:
         return False
     node.download_status[message.id] = DownloadStatus.Downloading
-    await queue.put((message, node))
+    # Increment before publishing to the queue: a worker may otherwise start
+    # immediately and report an incorrect total of zero.
     node.total_task += 1
+    await queue.put((message, node))
     return True
 
 
@@ -321,6 +323,8 @@ async def download_task(
         app.set_download_id(node, message.id, download_status)
 
     node.download_status[message.id] = download_status
+    if file_name:
+        node.download_file_names[message.id] = os.path.basename(file_name)
 
     file_size = os.path.getsize(file_name) if file_name else 0
 

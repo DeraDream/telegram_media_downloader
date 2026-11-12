@@ -1157,19 +1157,73 @@ async def _report_bot_status(
         if upload_result_str:
             upload_result_str = f"\n📤 {_t('Upload Progresses')}:\n" + upload_result_str
 
-        new_msg_str = (
-            f"`\n"
-            f"🆔 task id: {node.task_id}\n"
+        if node.total_task > 1:
+            active_count = sum(
+                status is DownloadStatus.Downloading
+                for status in node.download_status.values()
+            )
+            save_path = node.save_path or _t("Default directory")
+            album_detail = []
+            for number, (message_id, status) in enumerate(
+                node.download_status.items(), start=1
+            ):
+                if number > 12:
+                    album_detail.append("… 其余文件等待下载")
+                    break
+                active = download_result.get(node.chat_id, {}).get(message_id, {})
+                name = node.download_file_names.get(
+                    message_id, f"消息 {message_id}"
+                )
+                if active.get("task_id") == node.task_id:
+                    name = truncate_filename(
+                        os.path.basename(active["file_name"]), 24
+                    )
+                if status is DownloadStatus.SuccessDownload:
+                    album_detail.append(f"{number}. ✅ {name}")
+                elif status is DownloadStatus.FailedDownload:
+                    album_detail.append(f"{number}. ❌ {name}")
+                elif status is DownloadStatus.SkipDownload:
+                    album_detail.append(f"{number}. ⏩ {name}")
+                elif active.get("task_id") == node.task_id:
+                    total_size = active.get("total_size", 0)
+                    progress = (
+                        int(active["down_byte"] / total_size * 100)
+                        if total_size
+                        else 0
+                    )
+                    album_detail.append(
+                        f"{number}. ⏬ {name} "
+                        f"[{create_progress_bar(progress)}] {progress}% "
+                        f"{format_byte(active['download_speed'])}/s"
+                    )
+                else:
+                    album_detail.append(f"{number}. ⏳ {name} 等待中")
+
+            album_lines = "\n".join(album_detail)
+            new_msg_str = (
+                f"`📦 相册下载任务 #{node.task_id}\n"
+                f"📁 保存到：{save_path}\n"
+                f"├─ 总计：{node.total_task}\n"
+                f"├─ ✅ 成功：{node.success_download_task}\n"
+                f"├─ ❌ 失败：{node.failed_download_task}\n"
+                f"├─ ⏩ 跳过：{node.skip_download_task}\n"
+                f"└─ ⏳ 进行中：{active_count}\n\n"
+                f"{album_lines}\n`"
+            )
+        else:
+            new_msg_str = (
+                f"`\n"
+                f"🆔 task id: {node.task_id}\n"
             f"📥 {_t('Downloading')}: {format_byte(node.total_download_byte)}\n"
-            f"├─ 📁 {_t('Total')}: {node.total_download_task}\n"
+            f"├─ 📁 {_t('Total')}: {node.total_task}\n"
             f"├─ ✅ {_t('Success')}: {node.success_download_task}\n"
             f"├─ ❌ {_t('Failed')}: {node.failed_download_task}\n"
             f"└─ ⏩ {_t('Skipped')}: {node.skip_download_task}\n"
             f"{node.forward_msg_detail_str}"
             f"{upload_msg_detail_str}"
             f"{upload_result_str}"
-            f"{download_result_str}\n`"
-        )
+                f"{download_result_str}\n`"
+            )
 
         if new_msg_str != node.last_edit_msg:
             node.last_edit_msg = new_msg_str

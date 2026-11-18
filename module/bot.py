@@ -2,9 +2,11 @@
 
 import asyncio
 import hashlib
+import json
 import os
 import shutil
 import subprocess
+from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, List, Union
@@ -469,8 +471,26 @@ async def storage_status(client: pyrogram.Client, message: pyrogram.types.Messag
     )
 
 
+def _version_key(version: str) -> tuple:
+    """Compare dotted release versions without an extra dependency."""
+    return tuple(int(part) for part in version.lstrip("v").split("."))
+
+
+def _latest_release_version() -> str:
+    """Read the newest Git tag before downloading a Docker image."""
+    request = Request(
+        "https://api.github.com/repos/DeraDream/telegram_media_downloader/tags?per_page=1",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "tdl-bot"},
+    )
+    with urlopen(request, timeout=15) as response:  # nosec: public release API
+        tags = json.load(response)
+    if not tags or not tags[0].get("name"):
+        raise ValueError("no release tag found")
+    return tags[0]["name"].lstrip("v")
+
+
 async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
-    """Pull the configured image then restart this container via Docker socket."""
+    """Check version first, then pull and restart only when an update exists."""
     container = os.getenv("SELF_UPDATE_CONTAINER", "telegram-media-downloader")
     image = "yforward7/telegram_media_downloader:latest"
     if not os.path.exists("/var/run/docker.sock"):
@@ -481,7 +501,24 @@ async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
         )
         return
 
-    status = await client.send_message(message.chat.id, "🔄 正在拉取最新镜像…")
+    status = await client.send_message(message.chat.id, "🔎 正在检查更新…")
+    try:
+        latest = await _bot.app.loop.run_in_executor(None, _latest_release_version)
+    except Exception as exc:
+        logger.warning(f"Could not check latest release: {exc}")
+        await client.edit_message_text(message.chat.id, status.id, "❌ 无法检查最新版本，请稍后重试。")
+        return
+
+    current = utils.__version__
+    if _version_key(latest) <= _version_key(current):
+        await client.edit_message_text(
+            message.chat.id, status.id, f"✅ 已是最新版本 v{current}"
+        )
+        return
+
+    await client.edit_message_text(
+        message.chat.id, status.id, f"🔄 发现新版本 v{latest}，正在拉取镜像…"
+    )
 
     def pull_image():
         return subprocess.run(
@@ -501,7 +538,7 @@ async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
         return
 
     await client.edit_message_text(
-        message.chat.id, status.id, "✅ 镜像已更新，正在重启机器人…"
+        message.chat.id, status.id, f"✅ 已更新至 v{latest}，正在重启机器人…"
     )
     # The process is intentionally restarted after the confirmation is sent.
     subprocess.Popen(["docker", "restart", container])

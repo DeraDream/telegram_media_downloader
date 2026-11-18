@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import shutil
+import threading
 import time
 from typing import List, Optional, Tuple, Union
 
@@ -28,7 +29,7 @@ from module.pyrogram_extension import (
     upload_telegram_chat,
 )
 from module.web import init_web
-from utils.format import truncate_filename, validate_title
+from utils.format import format_byte, truncate_filename, validate_title
 from utils.log import LogFilter
 from utils.meta import print_meta
 from utils.meta_data import MetaData
@@ -47,6 +48,68 @@ app = Application(CONFIG_NAME, DATA_FILE_NAME, APPLICATION_NAME)
 
 queue: asyncio.Queue = asyncio.Queue()
 RETRY_TIME_OUT = 3
+
+
+class DownloadSpaceReservations:
+    """Prevent concurrent downloads from reserving the same free disk space."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items = {}
+
+    @staticmethod
+    def _key(node: TaskNode, message_id: int):
+        return node.task_id, message_id
+
+    def reserve(self, node: TaskNode, message_id: int, size: int):
+        """Reserve a file's expected bytes before it is admitted to the queue."""
+        with self._lock:
+            free = shutil.disk_usage(app.temp_save_path).free
+            outstanding = sum(
+                item["total"] - item["written"] for item in self._items.values()
+            )
+            # Keep 5% of currently writable space for Docker, the OS and
+            # filesystem overhead. Outstanding jobs are deducted globally.
+            budget = int(free * 0.95) - outstanding
+            if size > budget:
+                return False, max(budget, 0), outstanding
+            self._items[self._key(node, message_id)] = {
+                "total": size,
+                "written": 0,
+            }
+            return True, budget - size, outstanding + size
+
+    def update(self, node: TaskNode, message_id: int, written: int):
+        """Release the reserved portion that is already physically written."""
+        with self._lock:
+            item = self._items.get(self._key(node, message_id))
+            if item:
+                item["written"] = min(max(written, 0), item["total"])
+
+    def release(self, node: TaskNode, message_id: int):
+        with self._lock:
+            self._items.pop(self._key(node, message_id), None)
+
+
+space_reservations = DownloadSpaceReservations()
+
+
+def _media_size(message: pyrogram.types.Message) -> int:
+    """Return the expected file size for the first downloadable media type."""
+    for media_type in app.media_types:
+        media = getattr(message, media_type, None)
+        if media:
+            return int(getattr(media, "file_size", 0) or 0)
+    if app.enable_download_txt and message.text and not message.media:
+        return len(message.text.encode("utf-8"))
+    return 0
+
+
+async def update_download_progress(*args):
+    """Track normal progress and keep the remaining-space reservation current."""
+    await update_download_status(*args)
+    down_byte, _, message_id, _, _, node, _ = args
+    space_reservations.update(node, message_id, down_byte)
 
 logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
 logging.getLogger("pyrogram.client").addFilter(LogFilter())
@@ -272,6 +335,33 @@ async def add_download_task(
     """Add Download task"""
     if message.empty:
         return False
+    size = _media_size(message)
+    if size:
+        admitted, available, reserved = space_reservations.reserve(
+            node, message.id, size
+        )
+    else:
+        admitted, available, reserved = False, 0, 0
+    if not admitted:
+        node.download_status[message.id] = DownloadStatus.FailedDownload
+        if size:
+            error = f"空间不足：需 {format_byte(size)}，可分配 {format_byte(available)}"
+        else:
+            error = "无法获取文件大小，未开始下载"
+        node.download_file_names[message.id] = error
+        node.space_errors[message.id] = error
+        node.total_task += 1
+        logger.warning(
+            "Skip message {}: {} (file={}, available={}, reserved={})",
+            message.id,
+            "insufficient space" if size else "unknown file size",
+            size,
+            available,
+            reserved,
+        )
+        await report_bot_download_status(node.bot, node, DownloadStatus.FailedDownload)
+        return False
+
     node.download_status[message.id] = DownloadStatus.Downloading
     # Increment before publishing to the queue: a worker may otherwise start
     # immediately and report an incorrect total of zero.
@@ -455,7 +545,7 @@ async def download_media(
             temp_download_path = await client.download_media(
                 message,
                 file_name=temp_file_name,
-                progress=update_download_status,
+                progress=update_download_progress,
                 progress_args=(
                     message_id,
                     ui_file_name,
@@ -536,6 +626,7 @@ def _check_config() -> bool:
 async def worker(client: pyrogram.client.Client):
     """Work for download task"""
     while app.is_running:
+        item = None
         try:
             item = await queue.get()
             message = item[0]
@@ -550,6 +641,11 @@ async def worker(client: pyrogram.client.Client):
                 await download_task(client, message, node)
         except Exception as e:
             logger.exception(f"{e}")
+        finally:
+            if item:
+                message, node = item
+                space_reservations.release(node, message.id)
+                queue.task_done()
 
 
 async def download_chat_task(

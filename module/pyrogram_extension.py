@@ -1212,6 +1212,9 @@ async def _report_bot_status(
                     result = f"✅ 下载完成 · {node.success_download_task} 个文件"
                     if node.skip_download_task:
                         result += f" · 跳过 {node.skip_download_task}"
+                space_errors = getattr(node, "space_errors", {})
+                if space_errors:
+                    result += f"\n⚠️ {next(iter(space_errors.values()))}"
                 new_msg_str = f"{result}\n📁 已保存到：{destination}"
             else:
                 new_msg_str = (

@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -254,7 +255,8 @@ class DownloadBot:
         admin = await self.client.get_me()
         self.allowed_user_ids.append(admin.id)
 
-        await self.bot.set_bot_commands(commands)
+        # Commands live in the reply keyboard instead of Telegram's menu button.
+        await self.bot.delete_bot_commands()
 
         self.bot.add_handler(
             MessageHandler(
@@ -344,6 +346,13 @@ class DownloadBot:
 
         self.bot.add_handler(
             MessageHandler(
+                storage_status,
+                filters=pyrogram.filters.command(["storage"])
+                & pyrogram.filters.user(self.allowed_user_ids),
+            )
+        )
+        self.bot.add_handler(
+            MessageHandler(
                 stop,
                 filters=pyrogram.filters.command(["stop"])
                 & pyrogram.filters.user(self.allowed_user_ids),
@@ -399,6 +408,50 @@ async def stop_download_bot():
         _bot.monitor_task = None
 
 
+def _command_keyboard():
+    """Persistent three-column command keyboard shown below the input field."""
+    return types.ReplyKeyboardMarkup(
+        [
+            ["/download", "/files", "/storage"],
+            ["/forward", "/get_info", "/listen_forward"],
+            ["/forward_to_comments", "/set_language", "/stop"],
+            ["/help", "/add_filter", "/start"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def _directory_size(path: str) -> int:
+    """Calculate directory size without following symlinks."""
+    total = 0
+    for directory, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(directory, name))
+            except OSError:
+                pass
+    return total
+
+
+async def storage_status(client: pyrogram.Client, message: pyrogram.types.Message):
+    """Show download-library and VPS disk usage in one compact response."""
+    library_path = _bot.app.save_path
+    library_size = await _bot.app.loop.run_in_executor(
+        None, _directory_size, library_path
+    )
+    disk = shutil.disk_usage(library_path)
+    await client.send_message(
+        message.chat.id,
+        "💾 存储空间\n\n"
+        f"📂 下载视频库  {format_byte(library_size)}\n\n"
+        f"🖥 VPS 硬盘  总容量：{format_byte(disk.total)}\n"
+        f"🗂 已使用：{format_byte(disk.used)}\n"
+        f"🟢 剩余空间：{format_byte(disk.free)} · "
+        f"{disk.free / disk.total * 100:.1f}%",
+        reply_markup=_command_keyboard(),
+    )
+
+
 async def send_help_str(client: pyrogram.Client, chat_id):
     """
     Sends a help string to the specified chat ID using the provided client.
@@ -415,19 +468,6 @@ async def send_help_str(client: pyrogram.Client, chat_id):
         its version, and the available commands.
     """
 
-    update_keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "Github",
-                    url="https://github.com/tangyoha/telegram_media_downloader/releases",
-                ),
-                InlineKeyboardButton(
-                    "Join us", url="https://t.me/TeegramMediaDownload"
-                ),
-            ]
-        ]
-    )
     latest_release_str = ""
     # try:
     #     latest_release = get_latest_release(_bot.app.proxy)
@@ -452,7 +492,8 @@ async def send_help_str(client: pyrogram.Client, chat_id):
         f"/listen_forward - {_t('Listen for forwarded messages')}\n"
         f"/forward_to_comments - {_t('Forward a specific media to a comment section')}\n"
         f"/set_language - {_t('Set language')}\n"
-        f"/stop - {_t('Stop bot download or forward')}\n\n"
+        f"/stop - {_t('Stop bot download or forward')}\n"
+        "/storage - 查看下载库和 VPS 磁盘空间\n\n"
         # f"/add_replace_ad - {_t('Add replace advertisement filter')}\n"
         # f"/remove_replace_ad - {_t('Remove replace advertisement filter')}\n"
         # f"/add_filter_ad - {_t('Add filter advertisement filter')}\n"
@@ -463,7 +504,7 @@ async def send_help_str(client: pyrogram.Client, chat_id):
         f"`[` `]` {_t('means optional, not required')}\n"
     )
 
-    await client.send_message(chat_id, msg, reply_markup=update_keyboard)
+    await client.send_message(chat_id, msg, reply_markup=_command_keyboard())
 
 
 async def help_command(client: pyrogram.Client, message: pyrogram.types.Message):

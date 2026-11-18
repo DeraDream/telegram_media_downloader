@@ -1047,6 +1047,12 @@ async def report_bot_forward_status(
     await report_bot_status(client, node)
 
 
+def _progress_dots(progress: int) -> str:
+    """A light, readable progress indicator for Telegram status cards."""
+    complete = max(0, min(10, round(progress / 10)))
+    return "● " * complete + "○ " * (10 - complete)
+
+
 async def report_bot_status(
     client: pyrogram.Client,
     node: TaskNode,
@@ -1186,7 +1192,7 @@ async def _report_bot_status(
                 f"{title}\n"
                 f"📁 {destination}\n"
                 f"🎬 {name}\n"
-                f"{create_progress_bar(progress)} {progress}%\n"
+                f"{_progress_dots(progress).rstrip()}  {progress}%\n"
                 f"{format_byte(downloaded)} / {format_byte(total_size)}"
                 f" · ⚡ {format_byte(active.get('download_speed', 0))}/s"
             )

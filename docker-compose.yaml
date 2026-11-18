@@ -4,6 +4,8 @@ services:
   telegram_media_downloader:
     image: yforward7/telegram_media_downloader:latest
     build: .
+    container_name: telegram-media-downloader
+    restart: unless-stopped
     ports:
       # Here is what you need to edit
       - "5000:5000"
@@ -23,7 +25,11 @@ services:
       - "./log/:/app/log/"
       - "./sessions/:/app/sessions"
       - "./temp/:/app/temp"
-    #restart: "unless-stopped"
+      # Required only for the in-bot “更新” button. It grants this container
+      # Docker control, so do not expose bot access to untrusted users.
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    environment:
+      - SELF_UPDATE_CONTAINER=telegram-media-downloader
 # volumes:
 #   sessions:
 #   temp:

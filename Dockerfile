@@ -21,8 +21,9 @@ FROM python:3.11.9-alpine AS runtime-image
 
 WORKDIR /app
 
-# ffmpeg is needed at runtime to create local video thumbnails.
-RUN apk add --no-cache ffmpeg
+# ffmpeg is needed at runtime to create local video thumbnails. docker-cli is
+# used by the optional, explicitly enabled self-update button.
+RUN apk add --no-cache ffmpeg docker-cli
 
 # Copy installed deps from build stage
 COPY --from=compile-image /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages

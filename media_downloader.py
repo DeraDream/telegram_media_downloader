@@ -415,6 +415,9 @@ async def download_task(
     node.download_status[message.id] = download_status
     if file_name:
         node.download_file_names[message.id] = os.path.basename(file_name)
+    elif download_status is DownloadStatus.FailedDownload:
+        node.download_file_names[message.id] = "下载失败"
+        node.download_errors.setdefault(message.id, "文件下载失败，请稍后重试")
 
     file_size = os.path.getsize(file_name) if file_name else 0
 
@@ -645,6 +648,7 @@ async def worker(client: pyrogram.client.Client):
                 message, node = item
                 node.download_status[message.id] = DownloadStatus.FailedDownload
                 node.download_file_names[message.id] = "下载失败"
+                node.download_errors[message.id] = f"{type(e).__name__}: {e}"
                 await report_bot_download_status(
                     node.bot, node, DownloadStatus.FailedDownload
                 )

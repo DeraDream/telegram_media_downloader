@@ -173,6 +173,7 @@ class TaskNode:
         # Keep resolved names so album progress can show every item's state.
         self.download_file_names: dict = {}
         self.space_errors: dict = {}
+        self.download_errors: dict = {}
         self.upload_status: dict = {}
         self.upload_stat_dict: dict = {}
         self.topic_id = topic_id

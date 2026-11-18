@@ -641,6 +641,13 @@ async def worker(client: pyrogram.client.Client):
                 await download_task(client, message, node)
         except Exception as e:
             logger.exception(f"{e}")
+            if item:
+                message, node = item
+                node.download_status[message.id] = DownloadStatus.FailedDownload
+                node.download_file_names[message.id] = "下载失败"
+                await report_bot_download_status(
+                    node.bot, node, DownloadStatus.FailedDownload
+                )
         finally:
             if item:
                 message, node = item

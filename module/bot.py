@@ -58,6 +58,9 @@ class PendingDirectDownload:
     key: str
     user_id: int
     client: pyrogram.Client
+    # May differ for link downloads: prompts are sent by the bot while media
+    # must be fetched by the authenticated user client that can access source.
+    download_client: pyrogram.Client = None
     messages: list = field(default_factory=list)
     # Message in the bot chat to which prompts/status cards should reply.
     reply_to_message_id: int = 0
@@ -1641,7 +1644,7 @@ async def _start_pending_download(pending: PendingDirectDownload, folder: str = 
         bot=_bot.bot,
         task_id=_bot.gen_task_id(),
     )
-    node.client = pending.client
+    node.client = pending.download_client or pending.client
     node.save_path = folder
     node.progress_message_has_media = bool(thumb_id and progress_message.photo)
     _bot.add_task_node(node)
@@ -1717,6 +1720,7 @@ async def ask_link_download_folder(
         key=f"link-{request_message.from_user.id}-{request_message.id}",
         user_id=request_message.from_user.id,
         client=client,
+        download_client=_bot.client,
         messages=download_messages,
         reply_to_message_id=request_message.id,
     )

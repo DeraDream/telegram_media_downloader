@@ -528,7 +528,7 @@ def _recreate_container():
             f"{project_path}:{project_path}",
             "-w",
             project_path,
-            "docker/compose:2.27.0",
+            "docker/compose:latest",
             "-f",
             compose_file,
             "up",

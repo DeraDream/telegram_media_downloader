@@ -61,37 +61,126 @@ class DownloadSpaceReservations:
     def _key(node: TaskNode, message_id: int):
         return node.task_id, message_id
 
-    def reserve(self, node: TaskNode, message_id: int, size: int):
-        """Reserve a file's expected bytes before it is admitted to the queue."""
+    @staticmethod
+    def _device(path: str) -> int:
+        """Return the device containing ``path``, including not-yet-made dirs."""
+        path = os.path.abspath(path)
+        while not os.path.exists(path):
+            parent = os.path.dirname(path)
+            if parent == path:
+                break
+            path = parent
+        return os.stat(path).st_dev
+
+    def _outstanding(self, device: int) -> int:
+        return sum(item["devices"].get(device, 0) for item in self._items.values())
+
+    def _sync_app_state(self):
+        by_device = {}
+        for item in self._items.values():
+            for device, amount in item["devices"].items():
+                by_device[device] = by_device.get(device, 0) + amount
+        app.space_reservation_bytes = sum(by_device.values())
+        app.space_reservation_count = len(self._items)
+        app.space_reservation_by_device = by_device
+
+    def reserve(self, node: TaskNode, message_id: int, size: int, destination: str):
+        """Reserve temp and final disks independently when they differ.
+
+        A move across filesystems is a copy, so both the temporary filesystem
+        and the destination filesystem need a full reservation.  On one
+        filesystem they intentionally share one reservation.
+        """
         with self._lock:
-            free = shutil.disk_usage(app.temp_save_path).free
-            outstanding = sum(
-                item["total"] - item["written"] for item in self._items.values()
-            )
-            # Keep 5% of currently writable space for Docker, the OS and
-            # filesystem overhead. Outstanding jobs are deducted globally.
-            budget = int(free * 0.95) - outstanding
-            if size > budget:
-                return False, max(budget, 0), outstanding
+            temp_device = self._device(app.temp_save_path)
+            destination_device = self._device(destination)
+            devices = {temp_device}
+            if destination_device != temp_device:
+                devices.add(destination_device)
+            budgets = {}
+            for device in devices:
+                path = app.temp_save_path if device == temp_device else destination
+                budgets[device] = int(shutil.disk_usage(path).free * 0.95) - self._outstanding(device)
+            available = min(budgets.values())
+            if size > available:
+                return False, max(available, 0), self._outstanding(temp_device)
             self._items[self._key(node, message_id)] = {
                 "total": size,
-                "written": 0,
+                "temp_device": temp_device,
+                # The final copy stays fully reserved until shutil.move ends.
+                "devices": {device: size for device in devices},
             }
-            return True, budget - size, outstanding + size
+            self._sync_app_state()
+            return True, available - size, self._outstanding(temp_device)
 
     def update(self, node: TaskNode, message_id: int, written: int):
-        """Release the reserved portion that is already physically written."""
+        """Release only bytes written in temp; keep cross-disk final reserve."""
         with self._lock:
             item = self._items.get(self._key(node, message_id))
             if item:
-                item["written"] = min(max(written, 0), item["total"])
+                remaining = item["total"] - min(max(written, 0), item["total"])
+                item["devices"][item["temp_device"]] = remaining
+                self._sync_app_state()
+
+    def reserved_on(self, path: str) -> int:
+        """Return outstanding reservations on the filesystem containing path."""
+        with self._lock:
+            return self._outstanding(self._device(path))
 
     def release(self, node: TaskNode, message_id: int):
         with self._lock:
             self._items.pop(self._key(node, message_id), None)
+            self._sync_app_state()
 
 
 space_reservations = DownloadSpaceReservations()
+
+
+class AdaptiveDownloadGate:
+    """Reduce active downloads after Telegram throttles, then recover slowly."""
+
+    def __init__(self):
+        self.active = 0
+        self.limit = 10
+        self.successes = 0
+        self.condition = None
+
+    async def acquire(self):
+        if self.condition is None:
+            self.condition = asyncio.Condition()
+        async with self.condition:
+            self.limit = min(self.limit, app.max_download_task)
+            while self.active >= self.limit:
+                await self.condition.wait()
+            self.active += 1
+
+    async def release(self):
+        if not self.condition:
+            return
+        async with self.condition:
+            self.active = max(0, self.active - 1)
+            self.condition.notify_all()
+
+    async def throttled(self):
+        if not self.condition:
+            return
+        async with self.condition:
+            self.limit = max(1, self.limit - 1)
+            self.successes = 0
+            self.condition.notify_all()
+
+    async def succeeded(self):
+        if not self.condition:
+            return
+        async with self.condition:
+            self.successes += 1
+            if self.successes >= 20 and self.limit < app.max_download_task:
+                self.limit += 1
+                self.successes = 0
+                self.condition.notify_all()
+
+
+adaptive_download_gate = AdaptiveDownloadGate()
 
 
 def _media_size(message: pyrogram.types.Message) -> int:
@@ -103,6 +192,27 @@ def _media_size(message: pyrogram.types.Message) -> int:
     if app.enable_download_txt and message.text and not message.media:
         return len(message.text.encode("utf-8"))
     return 0
+
+
+def _download_error_message(exc: Exception) -> str:
+    """Turn common Telegram/network failures into actionable Chinese status."""
+    text = str(exc)
+    name = type(exc).__name__
+    if "CHANNEL_INVALID" in text or "ChannelInvalid" in name:
+        return "无法访问源频道：请确认登录账号已加入该频道"
+    if "USER_NOT_PARTICIPANT" in text or "PEER_ID_INVALID" in text:
+        return "账号未加入源频道或无法访问该聊天"
+    if "CHAT_FORWARDS_RESTRICTED" in text or "protected" in text.lower():
+        return "源内容受保护，Telegram 不允许转发或下载"
+    if "FILE_REFERENCE" in text:
+        return "文件引用已失效，请重新发送链接后重试"
+    if "MESSAGE_ID_INVALID" in text or "MessageIdInvalid" in name:
+        return "源消息不存在或已被删除"
+    if "FloodWait" in name or "FLOOD_WAIT" in text:
+        return "Telegram 限流：任务将稍后重试"
+    if "Timeout" in name or "timed out" in text.lower():
+        return "网络超时，请稍后重试"
+    return f"下载失败：{name}"
 
 
 async def update_download_progress(*args):
@@ -337,8 +447,11 @@ async def add_download_task(
         return False
     size = _media_size(message)
     if size:
+        # Default paths live below save_path; custom direct-download folders
+        # may be mounted elsewhere and must be checked separately.
+        destination = node.save_path or app.save_path
         admitted, available, reserved = space_reservations.reserve(
-            node, message.id, size
+            node, message.id, size, destination
         )
     else:
         admitted, available, reserved = False, 0, 0
@@ -577,6 +690,7 @@ async def download_media(
                     f"{_t('file reference expired for 3 retries, download skipped.')}"
                 )
         except pyrogram.errors.exceptions.flood_420.FloodWait as wait_err:
+            await adaptive_download_gate.throttled()
             await asyncio.sleep(wait_err.value)
             logger.warning("Message[{}]: FlowWait {}", message.id, wait_err.value)
             _check_timeout(retry, message.id)
@@ -638,17 +752,23 @@ async def worker(client: pyrogram.client.Client):
             if node.is_stop_transmission:
                 continue
 
-            if node.client:
-                await download_task(node.client, message, node)
-            else:
-                await download_task(client, message, node)
+            await adaptive_download_gate.acquire()
+            try:
+                if node.client:
+                    await download_task(node.client, message, node)
+                else:
+                    await download_task(client, message, node)
+                if node.download_status.get(message.id) is DownloadStatus.SuccessDownload:
+                    await adaptive_download_gate.succeeded()
+            finally:
+                await adaptive_download_gate.release()
         except Exception as e:
             logger.exception(f"{e}")
             if item:
                 message, node = item
                 node.download_status[message.id] = DownloadStatus.FailedDownload
                 node.download_file_names[message.id] = "下载失败"
-                node.download_errors[message.id] = f"{type(e).__name__}: {e}"
+                node.download_errors[message.id] = _download_error_message(e)
                 await report_bot_download_status(
                     node.bot, node, DownloadStatus.FailedDownload
                 )

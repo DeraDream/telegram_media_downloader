@@ -378,6 +378,9 @@ class Application:
         self.is_running = True
 
         self.total_download_task = 0
+        self.space_reservation_bytes: int = 0
+        self.space_reservation_count: int = 0
+        self.space_reservation_by_device: dict = {}
 
         self.chat_download_config: dict = {}
 

@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
@@ -67,6 +68,7 @@ class PendingDirectDownload:
     prompt_message_id: int = 0
     waiting_custom_path: bool = False
     collect_task: object = None
+    recovery_id: str = ""
 
 
 @dataclass
@@ -116,6 +118,8 @@ class DownloadBot:
         # Kept per user, and persisted in bot.yaml, so choosing the default
         # directory never overwrites the last custom destination.
         self.last_custom_download_folders: dict = {}
+        self.recoverable_downloads: dict = {}
+        self.recovery_in_progress: set = set()
 
     def gen_task_id(self) -> int:
         """Gen task id"""
@@ -152,6 +156,9 @@ class DownloadBot:
 
             for key, value in self.task_node.copy().items():
                 if value.is_running and value.is_finish():
+                    self.remove_recoverable_download(
+                        getattr(value, "recovery_id", "")
+                    )
                     self.remove_task_node(key)
             await asyncio.sleep(3)
 
@@ -174,6 +181,7 @@ class DownloadBot:
             for user_id, folder in _config.get("last_custom_download_folders", {}).items()
             if isinstance(folder, str)
         }
+        self.recoverable_downloads = _config.get("recoverable_downloads", {}) or {}
 
         return True
 
@@ -181,8 +189,71 @@ class DownloadBot:
         """Persist bot settings, including the last custom destination."""
         self.config["download_filter"] = self.download_filter
         self.config["last_custom_download_folders"] = self.last_custom_download_folders
+        self.config["recoverable_downloads"] = self.recoverable_downloads
         with open(self.config_path, "w", encoding="utf-8") as yaml_file:
             self._yaml.dump(self.config, yaml_file)
+
+    def remove_recoverable_download(self, recovery_id: str):
+        self.recovery_in_progress.discard(recovery_id)
+        if recovery_id and self.recoverable_downloads.pop(recovery_id, None):
+            try:
+                self.update_config()
+            except OSError as exc:
+                logger.warning(f"Could not remove recovered download record: {exc}")
+
+    async def recover_downloads(self):
+        """Requeue interrupted tasks, backing off instead of abandoning failures."""
+        while self.is_running:
+            now = time.time()
+            for recovery_id, record in list(self.recoverable_downloads.items()):
+                if recovery_id in self.recovery_in_progress:
+                    continue
+                if now < record.get("next_recovery_at", 0):
+                    continue
+                try:
+                    self.recovery_in_progress.add(recovery_id)
+                    source_client = self.client if record.get("use_user_client") else self.bot
+                    messages = []
+                    for source in record.get("messages", []):
+                        fetched = await source_client.get_messages(
+                            source["chat_id"], source["message_id"]
+                        )
+                        if fetched and not fetched.empty:
+                            messages.append(fetched)
+                    if not messages:
+                        raise ValueError("source messages are unavailable")
+                    folder_name = record.get("folder")
+                    folder = os.path.join(_bot.app.save_path, folder_name) if folder_name else None
+                    pending = PendingDirectDownload(
+                        token="recovery", key=f"recovery-{recovery_id}",
+                        user_id=record["user_id"], client=self.bot,
+                        download_client=source_client, messages=messages,
+                        recovery_id=recovery_id,
+                    )
+                    await _start_pending_download(pending, folder)
+                except Exception as exc:
+                    # Keep the source IDs.  Transient login/network/API failures
+                    # should not turn a restart into a permanently lost task.
+                    attempts = int(record.get("recovery_attempts", 0)) + 1
+                    delay = min(300, 30 * (2 ** min(attempts - 1, 3)))
+                    record["recovery_attempts"] = attempts
+                    record["next_recovery_at"] = time.time() + delay
+                    if not record.get("recovery_notice_sent"):
+                        record["recovery_notice_sent"] = True
+                        try:
+                            await self.bot.send_message(
+                                record["user_id"],
+                                f"⚠️ 下载任务恢复失败，将在约 {delay // 60 or 1} 分钟后自动重试。",
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        self.update_config()
+                    except OSError as save_exc:
+                        logger.warning(f"Could not save recovery retry: {save_exc}")
+                    logger.warning(f"Could not recover download {recovery_id}: {exc}")
+                    self.recovery_in_progress.discard(recovery_id)
+            await asyncio.sleep(5)
 
     async def start(
         self,
@@ -389,6 +460,8 @@ class DownloadBot:
             pass
 
         self.reply_task = _bot.app.loop.create_task(_bot.update_reply_message())
+        if self.recoverable_downloads:
+            _bot.app.loop.create_task(self.recover_downloads())
 
         self.bot.add_handler(
             MessageHandler(
@@ -462,6 +535,24 @@ async def storage_status(client: pyrogram.Client, message: pyrogram.types.Messag
     # includes filesystem-reserved blocks, so expose both instead of hiding it.
     remaining = disk.total - disk.used
     reserved = remaining - disk.free
+    # Reservations apply per filesystem.  temp/ may be a different mount:
+    # moving there requires space on both mounts at the same time.
+    active_reservation = _bot.app.space_reservation_by_device.get(
+        os.stat(library_path).st_dev, 0
+    )
+    safe_budget = max(int(disk.free * 0.95) - active_reservation, 0)
+    temp_path = _bot.app.temp_save_path
+    temp_disk = shutil.disk_usage(temp_path)
+    temp_reservation = _bot.app.space_reservation_by_device.get(
+        os.stat(temp_path).st_dev, 0
+    )
+    temp_line = ""
+    if os.stat(temp_path).st_dev != os.stat(library_path).st_dev:
+        temp_line = (
+            f"\n🗃 临时盘可写：{format_byte(temp_disk.free)}"
+            f" · 预占：{format_byte(temp_reservation)}"
+            f" · 可分配：{format_byte(max(int(temp_disk.free * 0.95) - temp_reservation, 0))}"
+        )
     await client.send_message(
         message.chat.id,
         "💾 存储空间\n\n"
@@ -470,7 +561,11 @@ async def storage_status(client: pyrogram.Client, message: pyrogram.types.Messag
         f"🗂 已使用：{format_byte(disk.used)}\n"
         f"🟢 剩余空间：{format_byte(remaining)}\n"
         f"✍️ 可实际写入：{format_byte(disk.free)}\n"
-        f"⚙️ 系统保留：{format_byte(reserved)}",
+        f"⚙️ 系统保留：{format_byte(reserved)}\n\n"
+        f"📥 下载盘预占：{format_byte(active_reservation)}"
+        f"（{_bot.app.space_reservation_count} 个任务）\n"
+        f"✅ 可分配下载：{format_byte(safe_budget)}"
+        f"{temp_line}",
         reply_markup=_command_keyboard(),
     )
 
@@ -1515,6 +1610,12 @@ def _existing_folder_keyboard(token: str, page: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def _source_signature(user_id: int, messages: list) -> str:
+    """Stable identity for a direct request across restarts."""
+    sources = sorted(f"{item.chat.id}:{item.id}" for item in messages)
+    return hashlib.sha256(f"{user_id}|{'|'.join(sources)}".encode()).hexdigest()[:24]
+
+
 async def _ask_download_folder(pending: PendingDirectDownload):
     """Ask where a collected direct-download request should be saved."""
     if pending.key in _bot.handled_media_groups:
@@ -1532,6 +1633,25 @@ async def _ask_download_folder(pending: PendingDirectDownload):
 
     unique = {item.id: item for item in pending.messages}
     pending.messages = [unique[key] for key in sorted(unique)]
+    # Do not show another destination picker for an already queued (including
+    # restart-recoverable) source.  The notice is intentional feedback rather
+    # than silently ignoring the user's resend.
+    signature = _source_signature(pending.user_id, pending.messages)
+    already_prompted = any(
+        other is not pending
+        and _source_signature(other.user_id, other.messages) == signature
+        for other in _bot.pending_prompt_downloads.values()
+    )
+    if already_prompted or any(
+        record.get("source_signature") == signature
+        for record in _bot.recoverable_downloads.values()
+    ):
+        _bot.handled_media_groups[pending.key] = True
+        await pending.client.send_message(
+            pending.user_id, "ℹ️ 这组媒体已有下载任务，已避免重复创建。",
+            reply_to_message_id=pending.reply_to_message_id or pending.messages[0].id,
+        )
+        return
     _bot.handled_media_groups[pending.key] = True
     count = len(pending.messages)
     last_folder = _bot.last_custom_download_folders.get(str(pending.user_id))
@@ -1607,6 +1727,27 @@ async def collect_direct_download(client: pyrogram.Client, message: pyrogram.typ
     pending.collect_task = _bot.app.loop.create_task(flush())
 
 
+def _persist_pending_download(pending: PendingDirectDownload, node: TaskNode, folder: str):
+    """Persist source message IDs so an interrupted direct task can resume."""
+    recovery_id = pending.recovery_id or f"download-{_source_signature(pending.user_id, pending.messages)}"
+    pending.recovery_id = recovery_id
+    node.recovery_id = recovery_id
+    _bot.recoverable_downloads[recovery_id] = {
+        "user_id": pending.user_id,
+        "folder": os.path.relpath(folder, _bot.app.save_path) if folder else "",
+        "use_user_client": pending.download_client is _bot.client,
+        "source_signature": _source_signature(pending.user_id, pending.messages),
+        "messages": [
+            {"chat_id": item.chat.id, "message_id": item.id}
+            for item in pending.messages
+        ],
+    }
+    try:
+        _bot.update_config()
+    except OSError as exc:
+        logger.warning(f"Could not persist download recovery record: {exc}")
+
+
 async def _start_pending_download(pending: PendingDirectDownload, folder: str = None):
     """Create one task and one progress message for a forwarded batch."""
     _bot.pending_prompt_downloads.pop(pending.prompt_message_id, None)
@@ -1647,6 +1788,7 @@ async def _start_pending_download(pending: PendingDirectDownload, folder: str = 
     node.client = pending.download_client or pending.client
     node.save_path = folder
     node.progress_message_has_media = bool(thumb_id and progress_message.photo)
+    _persist_pending_download(pending, node, folder)
     _bot.add_task_node(node)
     for item in pending.messages:
         await _bot.add_download_task(item, node)

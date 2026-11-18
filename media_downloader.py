@@ -1,5 +1,6 @@
 """Downloads media from telegram."""
 import asyncio
+import hashlib
 import logging
 import os
 import shutil
@@ -134,6 +135,9 @@ class DownloadSpaceReservations:
 
 
 space_reservations = DownloadSpaceReservations()
+# Hash comparison and the subsequent move must be one operation: otherwise two
+# simultaneous workers can both miss the same duplicate before either moves it.
+content_deduplication_lock = threading.Lock()
 
 
 class AdaptiveDownloadGate:
@@ -269,6 +273,52 @@ def _move_to_download_path(temp_download_path: str, download_path: str):
     directory, _ = os.path.split(download_path)
     os.makedirs(directory, exist_ok=True)
     shutil.move(temp_download_path, download_path)
+
+
+def _file_sha256(path: str) -> str:
+    """Calculate a file hash without loading a media file into memory."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _find_duplicate_file(temp_download_path: str) -> Optional[str]:
+    """Scan downloads/ recursively for content equal to the temporary file."""
+    size = os.path.getsize(temp_download_path)
+    temp_hash = None
+    for directory, _, names in os.walk(app.save_path):
+        for name in names:
+            candidate = os.path.join(directory, name)
+            try:
+                # File size cheaply eliminates almost all candidates.  Hashes
+                # make the final decision, so equal-sized media is safe.
+                if (
+                    not os.path.isfile(candidate)
+                    or os.path.getsize(candidate) != size
+                ):
+                    continue
+                if temp_hash is None:
+                    temp_hash = _file_sha256(temp_download_path)
+                if _file_sha256(candidate) == temp_hash:
+                    return candidate
+            except OSError as exc:
+                logger.warning("Could not compare {}: {}", candidate, exc)
+    return None
+
+
+def _move_to_download_path_if_unique(
+    temp_download_path: str, download_path: str
+) -> Optional[str]:
+    """Move a completed file, or remove it and return its duplicate's path."""
+    with content_deduplication_lock:
+        duplicate = _find_duplicate_file(temp_download_path)
+        if duplicate:
+            os.remove(temp_download_path)
+            return duplicate
+        _move_to_download_path(temp_download_path, download_path)
+    return None
 
 
 def _check_timeout(retry: int, _: int):
@@ -674,8 +724,20 @@ async def download_media(
             if temp_download_path and isinstance(temp_download_path, str):
                 _check_download_finish(media_size, temp_download_path, ui_file_name)
                 await asyncio.sleep(0.5)
-                _move_to_download_path(temp_download_path, file_name)
-                # TODO: if not exist file size or media
+                duplicate = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    _move_to_download_path_if_unique,
+                    temp_download_path,
+                    file_name,
+                )
+                if duplicate:
+                    logger.info(
+                        "id={} {} is identical to {}, download skipped.",
+                        message.id,
+                        ui_file_name,
+                        duplicate,
+                    )
+                    return DownloadStatus.SkipDownload, None
                 return DownloadStatus.SuccessDownload, file_name
         except pyrogram.errors.exceptions.bad_request_400.BadRequest:
             logger.warning(

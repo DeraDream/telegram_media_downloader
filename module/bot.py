@@ -685,21 +685,55 @@ COMMAND_GUIDES = {
 }
 
 
+def _send_bot_api_message(payload: dict):
+    """Use Bot API features not yet exposed by the bundled Pyrogram fork."""
+    request = Request(
+        f"https://api.telegram.org/bot{_bot.app.bot_token}/sendMessage",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urlopen(request, timeout=20) as response:  # nosec: official Bot API
+        result = json.load(response)
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Bot API request failed"))
+
+
 async def _send_command_guide(client: pyrogram.Client, message, guide: tuple):
-    """Show a clean description and a standalone copyable command prefix."""
+    """Show a guide with Telegram's native copy-to-clipboard buttons."""
     title, description, command, parameters, example = guide
     text = (
         f"{title}\n{description}\n\n"
         f"命令\n<blockquote>{command}</blockquote>\n\n"
         f"参数\n{parameters}\n\n"
-        f"完整示例（可复制）\n<blockquote>{example}</blockquote>"
+        f"完整示例\n<blockquote>{example}</blockquote>"
     )
-    await client.send_message(
-        message.chat.id,
-        text,
-        parse_mode=pyrogram.enums.ParseMode.HTML,
-        reply_markup=_command_keyboard(),
-    )
+    payload = {
+        "chat_id": message.chat.id,
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_markup": {
+            "inline_keyboard": [
+                [
+                    {"text": "📋 复制命令", "copy_text": {"text": command}},
+                    {
+                        "text": "📋 复制完整示例",
+                        "copy_text": {"text": example},
+                    },
+                ]
+            ]
+        },
+    }
+    try:
+        await _bot.app.loop.run_in_executor(None, _send_bot_api_message, payload)
+    except Exception as exc:
+        # Keep the guide usable on older Telegram/Pyrogram deployments.
+        logger.warning(f"Could not create copy buttons: {exc}")
+        await client.send_message(
+            message.chat.id,
+            text,
+            parse_mode=pyrogram.enums.ParseMode.HTML,
+            reply_markup=_command_keyboard(),
+        )
 
 
 async def keyboard_command(client: pyrogram.Client, message: pyrogram.types.Message):

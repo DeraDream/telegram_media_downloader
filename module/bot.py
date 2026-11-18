@@ -491,8 +491,10 @@ def _latest_release_version() -> str:
 
 async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
     """Check version first, then pull and restart only when an update exists."""
-    container = os.getenv("SELF_UPDATE_CONTAINER", "telegram-media-downloader")
     image = "yforward7/telegram_media_downloader:latest"
+    # This is the host path, used by a short-lived helper container to recreate
+    # us. ``docker restart`` only restarts the old image and cannot update it.
+    project_path = os.getenv("SELF_UPDATE_PROJECT", "/opt/telegram-media-downloader")
     if not os.path.exists("/var/run/docker.sock"):
         await client.send_message(
             message.chat.id,
@@ -538,10 +540,35 @@ async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
         return
 
     await client.edit_message_text(
-        message.chat.id, status.id, f"✅ 已更新至 v{latest}，正在重启机器人…"
+        message.chat.id, status.id, f"✅ 镜像已更新至 v{latest}，正在重建机器人…"
     )
-    # The process is intentionally restarted after the confirmation is sent.
-    subprocess.Popen(["docker", "restart", container])
+    # A separate helper survives while this container is replaced. Restarting
+    # ourselves would keep the container's old image ID.
+    compose_file = os.path.join(project_path, "compose.yaml")
+    try:
+        subprocess.Popen(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                "/var/run/docker.sock:/var/run/docker.sock",
+                "-v",
+                f"{project_path}:{project_path}",
+                "-w",
+                project_path,
+                "docker/compose:2.27.0",
+                "-f",
+                compose_file,
+                "up",
+                "-d",
+                "--force-recreate",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        await client.edit_message_text(message.chat.id, status.id, f"❌ 重建失败：{exc}")
 
 
 async def keyboard_command(client: pyrogram.Client, message: pyrogram.types.Message):

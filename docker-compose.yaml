@@ -29,7 +29,8 @@ services:
       # Docker control, so do not expose bot access to untrusted users.
       - "/var/run/docker.sock:/var/run/docker.sock"
     environment:
-      - SELF_UPDATE_CONTAINER=telegram-media-downloader
+      # Absolute host path to this compose project, used by the update helper.
+      - SELF_UPDATE_PROJECT=/opt/telegram-media-downloader
 # volumes:
 #   sessions:
 #   temp:

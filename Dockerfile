@@ -23,7 +23,7 @@ WORKDIR /app
 
 # ffmpeg is needed at runtime to create local video thumbnails. docker-cli is
 # used by the optional, explicitly enabled self-update button.
-RUN apk add --no-cache ffmpeg docker-cli
+RUN apk add --no-cache ffmpeg docker-cli docker-cli-compose
 
 # Copy installed deps from build stage
 COPY --from=compile-image /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages

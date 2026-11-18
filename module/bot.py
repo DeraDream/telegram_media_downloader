@@ -513,27 +513,25 @@ def _latest_release_versions() -> tuple:
     return versions[0], available
 
 
-def _recreate_container():
-    """Run Compose from a helper that survives this container being replaced."""
+def _recreate_container(image: str):
+    """Run Compose from the new image so it survives this container's exit."""
     project_path = os.getenv("SELF_UPDATE_PROJECT", "/opt/telegram-media-downloader")
-    compose_file = os.path.join(project_path, "compose.yaml")
     return subprocess.Popen(
         [
             "docker",
             "run",
             "--rm",
+            "--entrypoint",
+            "/bin/sh",
             "-v",
             "/var/run/docker.sock:/var/run/docker.sock",
             "-v",
             f"{project_path}:{project_path}",
             "-w",
             project_path,
-            "docker/compose:latest",
-            "-f",
-            compose_file,
-            "up",
-            "-d",
-            "--force-recreate",
+            image,
+            "-c",
+            "docker compose -f compose.yaml up -d --force-recreate",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -609,7 +607,7 @@ async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
         message.chat.id, status.id, f"✅ 镜像已更新至 v{latest}，正在重建机器人…"
     )
     try:
-        _recreate_container()
+        _recreate_container(f"{image_repository}:latest")
     except OSError as exc:
         await client.edit_message_text(message.chat.id, status.id, f"❌ 重建失败：{exc}")
 
@@ -2438,7 +2436,7 @@ async def on_query_handler(
                 f"✅ 下载并发已设为 {limit}，正在重启以生效…",
             )
             await query.answer()
-            _recreate_container()
+            _recreate_container("yforward7/telegram_media_downloader:latest")
         except (ValueError, OSError) as exc:
             logger.warning(f"Could not change download concurrency: {exc}")
             await query.answer("设置失败，请稍后重试", show_alert=True)

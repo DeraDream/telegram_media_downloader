@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -302,7 +303,7 @@ class DownloadBot:
                 filters=pyrogram.filters.regex(
                     r"^(⬇️ 下载消息|📁 浏览文件|💾 存储空间|↗️ 转发消息|"
                     r"🔎 链接信息|👂 监听转发|💬 转发评论|🌐 设置语言|"
-                    r"⛔ 停止任务|❓ 帮助|🛡 添加过滤|🔄 更新)$"
+                    r"⛔ 停止任务|❓ 帮助|⚙️ 并发设置|🔄 更新)$"
                 )
                 & pyrogram.filters.user(self.allowed_user_ids),
             ),
@@ -429,7 +430,7 @@ def _command_keyboard():
             ["⬇️ 下载消息", "📁 浏览文件", "💾 存储空间"],
             ["↗️ 转发消息", "🔎 链接信息", "👂 监听转发"],
             ["💬 转发评论", "🌐 设置语言", "⛔ 停止任务"],
-            ["❓ 帮助", "🛡 添加过滤", "🔄 更新"],
+            ["❓ 帮助", "⚙️ 并发设置", "🔄 更新"],
         ],
         resize_keyboard=True,
     )
@@ -476,25 +477,72 @@ def _version_key(version: str) -> tuple:
     return tuple(int(part) for part in version.lstrip("v").split("."))
 
 
-def _latest_release_version() -> str:
-    """Read the newest Git tag before downloading a Docker image."""
+def _docker_image_exists(version: str) -> bool:
+    """Return whether Docker Hub already has the versioned image tag."""
     request = Request(
-        "https://api.github.com/repos/DeraDream/telegram_media_downloader/tags?per_page=1",
+        "https://hub.docker.com/v2/repositories/yforward7/"
+        f"telegram_media_downloader/tags/v{version}",
+        headers={"User-Agent": "tdl-bot"},
+    )
+    try:
+        with urlopen(request, timeout=15):  # nosec: public Docker Hub API
+            return True
+    except HTTPError as exc:
+        if exc.code == 404:
+            return False
+        raise
+
+
+def _latest_release_versions() -> tuple:
+    """Return newest Git tag and newest tag whose Docker image is available."""
+    request = Request(
+        "https://api.github.com/repos/DeraDream/telegram_media_downloader/tags?per_page=10",
         headers={"Accept": "application/vnd.github+json", "User-Agent": "tdl-bot"},
     )
     with urlopen(request, timeout=15) as response:  # nosec: public release API
         tags = json.load(response)
-    if not tags or not tags[0].get("name"):
+    versions = [tag.get("name", "").lstrip("v") for tag in tags]
+    versions = [version for version in versions if version]
+    if not versions:
         raise ValueError("no release tag found")
-    return tags[0]["name"].lstrip("v")
+    available = next(
+        (version for version in versions if _docker_image_exists(version)), None
+    )
+    if not available:
+        raise ValueError("no Docker image is available yet")
+    return versions[0], available
+
+
+def _recreate_container():
+    """Run Compose from a helper that survives this container being replaced."""
+    project_path = os.getenv("SELF_UPDATE_PROJECT", "/opt/telegram-media-downloader")
+    compose_file = os.path.join(project_path, "compose.yaml")
+    return subprocess.Popen(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "-v",
+            f"{project_path}:{project_path}",
+            "-w",
+            project_path,
+            "docker/compose:2.27.0",
+            "-f",
+            compose_file,
+            "up",
+            "-d",
+            "--force-recreate",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
     """Check version first, then pull and restart only when an update exists."""
-    image = "yforward7/telegram_media_downloader:latest"
-    # This is the host path, used by a short-lived helper container to recreate
-    # us. ``docker restart`` only restarts the old image and cannot update it.
-    project_path = os.getenv("SELF_UPDATE_PROJECT", "/opt/telegram-media-downloader")
+    image_repository = "yforward7/telegram_media_downloader"
     if not os.path.exists("/var/run/docker.sock"):
         await client.send_message(
             message.chat.id,
@@ -505,7 +553,9 @@ async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
 
     status = await client.send_message(message.chat.id, "🔎 正在检查更新…")
     try:
-        latest = await _bot.app.loop.run_in_executor(None, _latest_release_version)
+        newest_tag, latest = await _bot.app.loop.run_in_executor(
+            None, _latest_release_versions
+        )
     except Exception as exc:
         logger.warning(f"Could not check latest release: {exc}")
         await client.edit_message_text(message.chat.id, status.id, "❌ 无法检查最新版本，请稍后重试。")
@@ -513,9 +563,11 @@ async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
 
     current = utils.__version__
     if _version_key(latest) <= _version_key(current):
-        await client.edit_message_text(
-            message.chat.id, status.id, f"✅ 已是最新版本 v{current}"
-        )
+        if _version_key(newest_tag) > _version_key(current):
+            text = f"⏳ v{newest_tag} 正在打包，当前 v{current} 已是最新可用版本"
+        else:
+            text = f"✅ 已是最新版本 v{current}"
+        await client.edit_message_text(message.chat.id, status.id, text)
         return
 
     await client.edit_message_text(
@@ -523,8 +575,22 @@ async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
     )
 
     def pull_image():
+        versioned_image = f"{image_repository}:v{latest}"
+        result = subprocess.run(
+            ["docker", "pull", versioned_image],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        if result.returncode:
+            return result
+        # Compose uses :latest. Point that local tag to the version we verified
+        # instead of trusting a concurrently updated remote :latest tag.
         return subprocess.run(
-            ["docker", "pull", image], capture_output=True, text=True, timeout=900
+            ["docker", "tag", versioned_image, f"{image_repository}:latest"],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
 
     try:
@@ -542,49 +608,112 @@ async def self_update(client: pyrogram.Client, message: pyrogram.types.Message):
     await client.edit_message_text(
         message.chat.id, status.id, f"✅ 镜像已更新至 v{latest}，正在重建机器人…"
     )
-    # A separate helper survives while this container is replaced. Restarting
-    # ourselves would keep the container's old image ID.
-    compose_file = os.path.join(project_path, "compose.yaml")
     try:
-        subprocess.Popen(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "-v",
-                "/var/run/docker.sock:/var/run/docker.sock",
-                "-v",
-                f"{project_path}:{project_path}",
-                "-w",
-                project_path,
-                "docker/compose:2.27.0",
-                "-f",
-                compose_file,
-                "up",
-                "-d",
-                "--force-recreate",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        _recreate_container()
     except OSError as exc:
         await client.edit_message_text(message.chat.id, status.id, f"❌ 重建失败：{exc}")
 
 
+async def choose_concurrency(client: pyrogram.Client, message: pyrogram.types.Message):
+    """Show supported concurrent-download limits."""
+    await client.send_message(
+        message.chat.id,
+        f"⚙️ 当前并发下载：{_bot.app.max_download_task}\n请选择新的并发数：",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("1", callback_data="concurrency:1"),
+                    InlineKeyboardButton("3", callback_data="concurrency:3"),
+                    InlineKeyboardButton("5", callback_data="concurrency:5"),
+                    InlineKeyboardButton("10", callback_data="concurrency:10"),
+                ]
+            ]
+        ),
+    )
+
+
+COMMAND_GUIDES = {
+    "⬇️ 下载消息": (
+        "⬇️ 下载消息",
+        "按消息范围下载频道或群组中的媒体文件。",
+        "/download",
+        "频道链接 · 起始消息 ID · 结束消息 ID",
+        "/download https://t.me/c/频道ID 1 400",
+    ),
+    "↗️ 转发消息": (
+        "↗️ 转发消息",
+        "下载源频道媒体后转发到目标频道。",
+        "/forward",
+        "源频道链接 · 目标频道链接 · 起始消息 ID · 结束消息 ID · 过滤器（可选）",
+        "/forward https://t.me/c/源频道ID https://t.me/c/目标频道ID 1 400 [过滤器]",
+    ),
+    "🔎 链接信息": (
+        "🔎 链接信息",
+        "查看 Telegram 消息链接对应的频道、群组和消息信息。",
+        "/get_info",
+        "消息链接",
+        "/get_info https://t.me/c/频道ID/消息ID",
+    ),
+    "👂 监听转发": (
+        "👂 监听转发",
+        "持续监听源频道的新消息，并自动转发到目标频道。",
+        "/listen_forward",
+        "源频道链接 · 目标频道链接 · 过滤器（可选）",
+        "/listen_forward https://t.me/c/源频道ID https://t.me/c/目标频道ID [过滤器]",
+    ),
+    "💬 转发评论": (
+        "💬 转发到评论",
+        "把指定媒体转发到目标频道的评论区。",
+        "/forward_to_comments",
+        "源频道链接 · 目标频道链接 · 起始消息 ID · 结束消息 ID",
+        "/forward_to_comments https://t.me/c/源频道ID https://t.me/c/目标频道ID 1 400",
+    ),
+    "🌐 设置语言": (
+        "🌐 设置语言",
+        "切换机器人界面语言。可用：zh、en、ru、ua。",
+        "/set_language",
+        "语言：zh · en · ru · ua",
+        "/set_language zh",
+    ),
+    "🛡 添加过滤": (
+        "🛡 添加过滤",
+        "添加下载过滤表达式。",
+        "/add_filter",
+        "过滤表达式",
+        "/add_filter 过滤表达式",
+    ),
+}
+
+
+async def _send_command_guide(client: pyrogram.Client, message, guide: tuple):
+    """Show a clean description and a standalone copyable command prefix."""
+    title, description, command, parameters, example = guide
+    text = (
+        f"{title}\n{description}\n\n"
+        f"命令\n<blockquote>{command}</blockquote>\n\n"
+        f"参数\n{parameters}\n\n"
+        f"完整示例（可复制）\n<blockquote>{example}</blockquote>"
+    )
+    await client.send_message(
+        message.chat.id,
+        text,
+        parse_mode=pyrogram.enums.ParseMode.HTML,
+        reply_markup=_command_keyboard(),
+    )
+
+
 async def keyboard_command(client: pyrogram.Client, message: pyrogram.types.Message):
     """Run the action selected from the Chinese reply keyboard."""
+    guide = COMMAND_GUIDES.get(message.text)
+    if guide:
+        await _send_command_guide(client, message, guide)
+        return
     actions = {
-        "⬇️ 下载消息": download_from_bot,
         "📁 浏览文件": browse_files,
         "💾 存储空间": storage_status,
-        "↗️ 转发消息": forward_messages,
-        "🔎 链接信息": get_info,
-        "👂 监听转发": set_listen_forward_msg,
-        "💬 转发评论": forward_to_comments,
-        "🌐 设置语言": set_language,
         "⛔ 停止任务": stop,
         "❓ 帮助": help_command,
-        "🛡 添加过滤": add_filter,
+        "⚙️ 并发设置": choose_concurrency,
         "🔄 更新": self_update,
     }
     action = actions.get(message.text)
@@ -2258,6 +2387,28 @@ async def on_query_handler(
     Returns:
         None
     """
+
+    if query.data.startswith("concurrency:"):
+        try:
+            limit = int(query.data.split(":", 1)[1])
+            if limit not in (1, 3, 5, 10):
+                raise ValueError("unsupported limit")
+            _bot.app.max_download_task = limit
+            _bot.app.max_concurrent_transmissions = limit * 5
+            _bot.app.config["max_download_task"] = limit
+            _bot.app.config["max_concurrent_transmissions"] = limit * 5
+            _bot.app.update_config()
+            await client.edit_message_text(
+                query.from_user.id,
+                query.message.id,
+                f"✅ 下载并发已设为 {limit}，正在重启以生效…",
+            )
+            await query.answer()
+            _recreate_container()
+        except (ValueError, OSError) as exc:
+            logger.warning(f"Could not change download concurrency: {exc}")
+            await query.answer("设置失败，请稍后重试", show_alert=True)
+        return
 
     if query.data.startswith("file_"):
         try:

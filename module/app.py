@@ -403,7 +403,7 @@ class Application:
         self.max_concurrent_transmissions: int = 1
         self.web_host: str = "0.0.0.0"
         self.web_port: int = 5000
-        self.max_download_task: int = 5
+        self.max_download_task: int = 10
         self.language = Language.EN
         self.after_upload_telegram_delete: bool = True
         self.web_login_secret: str = ""

@@ -10,9 +10,9 @@ file_formats:
   - all
   video:
   - all
-file_path_prefix:
-- chat_title
-- media_datetime
+# Leave empty to save directly in downloads/. Add chat_title, media_datetime,
+# or media_type to enable automatic subfolders.
+file_path_prefix: []
 media_types:
 - audio
 - photo

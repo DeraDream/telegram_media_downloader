@@ -396,7 +396,9 @@ class Application:
         self.restart_program = False
         self.config: dict = {}
         self.app_data: dict = {}
-        self.file_path_prefix: List[str] = ["chat_title", "media_datetime"]
+        # Store in downloads/ directly unless the user explicitly enables
+        # category prefixes in config.yaml.
+        self.file_path_prefix: List[str] = []
         self.file_name_prefix: List[str] = ["message_id", "file_name"]
         self.file_name_prefix_split: str = " - "
         self.log_file_path = os.path.join(os.path.abspath("."), "log")
@@ -469,7 +471,7 @@ class Application:
             self.proxy = _config["proxy"]
         if _config.get("restart_program"):
             self.restart_program = _config["restart_program"]
-        if _config.get("file_path_prefix"):
+        if _config.get("file_path_prefix") is not None:
             self.file_path_prefix = _config["file_path_prefix"]
         if _config.get("file_name_prefix"):
             self.file_name_prefix = _config["file_name_prefix"]

@@ -1664,7 +1664,7 @@ async def _ask_download_folder(pending: PendingDirectDownload):
         pending.user_id,
         f"📦 检测到 {count} 个媒体文件。\n"
         "请选择保存位置：\n"
-        "默认目录会保持当前频道/日期分类规则；自定义目录会创建在 downloads/ 下。",
+        "默认目录会直接保存到 downloads/；自定义目录会创建在 downloads/ 下。",
         reply_to_message_id=pending.reply_to_message_id or first.id,
         reply_markup=InlineKeyboardMarkup(
             [
@@ -2715,7 +2715,7 @@ async def on_query_handler(
             await client.edit_message_text(
                 pending.user_id, pending.prompt_message_id, "✅ 使用默认目录，开始下载…"
             )
-            await _start_pending_download(pending)
+            await _start_pending_download(pending, _download_root())
             await query.answer()
             return
 

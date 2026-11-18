@@ -1157,76 +1157,64 @@ async def _report_bot_status(
         if upload_result_str:
             upload_result_str = f"\n📤 {_t('Upload Progresses')}:\n" + upload_result_str
 
+        # Keep the progress card compact: show the current file rather than a
+        # growing per-file report.  This works identically for one file and an
+        # album, while retaining the information needed during a download.
+        active_downloads = [
+            value
+            for value in download_result.get(node.chat_id, {}).values()
+            if value.get("task_id") == node.task_id
+            and value.get("down_byte") != value.get("total_size")
+        ]
+        finished = (
+            node.success_download_task
+            + node.failed_download_task
+            + node.skip_download_task
+        )
         if node.total_task > 1:
-            active_count = sum(
-                status is DownloadStatus.Downloading
-                for status in node.download_status.values()
-            )
-            save_path = node.save_path or _t("Default directory")
-            album_detail = []
-            for number, (message_id, status) in enumerate(
-                node.download_status.items(), start=1
-            ):
-                if number > 12:
-                    album_detail.append("… 其余文件等待下载")
-                    break
-                active = download_result.get(node.chat_id, {}).get(message_id, {})
-                name = node.download_file_names.get(
-                    message_id, f"消息 {message_id}"
-                )
-                if active.get("task_id") == node.task_id:
-                    name = truncate_filename(
-                        os.path.basename(active["file_name"]), 24
-                    )
-                if status is DownloadStatus.SuccessDownload:
-                    album_detail.append(f"{number}. ✅ {name}")
-                elif status is DownloadStatus.FailedDownload:
-                    album_detail.append(f"{number}. ❌ {name}")
-                elif status is DownloadStatus.SkipDownload:
-                    album_detail.append(f"{number}. ⏩ {name}")
-                elif active.get("task_id") == node.task_id:
-                    total_size = active.get("total_size", 0)
-                    progress = (
-                        int(active["down_byte"] / total_size * 100)
-                        if total_size
-                        else 0
-                    )
-                    album_detail.append(
-                        f"{number}. ⏬ {name} "
-                        f"[{create_progress_bar(progress)}] {progress}% "
-                        f"{format_byte(active['download_speed'])}/s"
-                    )
-                else:
-                    album_detail.append(f"{number}. ⏳ {name} 等待中")
-
-            album_lines = "\n".join(album_detail)
+            title = f"📦 批量下载 · 已完成 {finished}/{node.total_task}"
+        else:
+            title = "📥 正在下载"
+        destination = os.path.basename(node.save_path) if node.save_path else "默认目录"
+        if active_downloads:
+            active = active_downloads[0]
+            total_size = active.get("total_size", 0)
+            downloaded = active.get("down_byte", 0)
+            progress = int(downloaded / total_size * 100) if total_size else 0
+            name = truncate_filename(os.path.basename(active["file_name"]), 28)
             new_msg_str = (
-                f"`📦 相册下载任务 #{node.task_id}\n"
-                f"📁 保存到：{save_path}\n"
-                f"├─ 总计：{node.total_task}\n"
-                f"├─ ✅ 成功：{node.success_download_task}\n"
-                f"├─ ❌ 失败：{node.failed_download_task}\n"
-                f"├─ ⏩ 跳过：{node.skip_download_task}\n"
-                f"└─ ⏳ 进行中：{active_count}\n\n"
-                f"{album_lines}\n`"
+                f"{title}\n"
+                f"📁 {destination}\n"
+                f"🎬 {name}\n"
+                f"{create_progress_bar(progress)} {progress}%\n"
+                f"{format_byte(downloaded)} / {format_byte(total_size)}"
+                f" · ⚡ {format_byte(active.get('download_speed', 0))}/s"
             )
         else:
-            new_msg_str = (
-                f"`\n"
-                f"🆔 task id: {node.task_id}\n"
-            f"📥 {_t('Downloading')}: {format_byte(node.total_download_byte)}\n"
-            f"├─ 📁 {_t('Total')}: {node.total_task}\n"
-            f"├─ ✅ {_t('Success')}: {node.success_download_task}\n"
-            f"├─ ❌ {_t('Failed')}: {node.failed_download_task}\n"
-            f"└─ ⏩ {_t('Skipped')}: {node.skip_download_task}\n"
-            f"{node.forward_msg_detail_str}"
-            f"{upload_msg_detail_str}"
-            f"{upload_result_str}"
-                f"{download_result_str}\n`"
-            )
+            # The final edit remains visible after the task is removed from the
+            # update loop, so make success and failure immediately obvious.
+            if finished >= node.total_task:
+                if node.failed_download_task:
+                    result = (
+                        "❌ 下载结束"
+                        f" · 成功 {node.success_download_task}"
+                        f" · 失败 {node.failed_download_task}"
+                    )
+                    if node.skip_download_task:
+                        result += f" · 跳过 {node.skip_download_task}"
+                else:
+                    result = f"✅ 下载完成 · {node.success_download_task} 个文件"
+                    if node.skip_download_task:
+                        result += f" · 跳过 {node.skip_download_task}"
+                new_msg_str = f"{result}\n📁 已保存到：{destination}"
+            else:
+                new_msg_str = (
+                    f"{title}\n"
+                    f"📁 {destination}\n"
+                    "⏳ 正在准备或整理文件…"
+                )
 
         if new_msg_str != node.last_edit_msg:
-            node.last_edit_msg = new_msg_str
             if node.progress_message_has_media:
                 await client.edit_message_caption(
                     node.from_user_id,
@@ -1241,6 +1229,9 @@ async def _report_bot_status(
                     new_msg_str,
                     parse_mode=pyrogram.enums.ParseMode.MARKDOWN,
                 )
+            # Only mark it as sent after Telegram accepts the edit.  Otherwise
+            # a temporary API/flood-limit error would freeze this task's card.
+            node.last_edit_msg = new_msg_str
 
 
 def set_max_concurrent_transmissions(

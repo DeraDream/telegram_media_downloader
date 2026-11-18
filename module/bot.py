@@ -55,6 +55,8 @@ class PendingDirectDownload:
     user_id: int
     client: pyrogram.Client
     messages: list = field(default_factory=list)
+    # Message in the bot chat to which prompts/status cards should reply.
+    reply_to_message_id: int = 0
     prompt_message_id: int = 0
     waiting_custom_path: bool = False
     collect_task: object = None
@@ -104,6 +106,9 @@ class DownloadBot:
         self.pending_download_seq: int = 0
         self.file_browser_states: dict = {}
         self.file_browser_seq: int = 0
+        # Kept per user, and persisted in bot.yaml, so choosing the default
+        # directory never overwrites the last custom destination.
+        self.last_custom_download_folders: dict = {}
 
     def gen_task_id(self) -> int:
         """Gen task id"""
@@ -157,14 +162,19 @@ class DownloadBot:
         """
 
         self.download_filter = _config.get("download_filter", self.download_filter)
+        self.last_custom_download_folders = {
+            str(user_id): folder
+            for user_id, folder in _config.get("last_custom_download_folders", {}).items()
+            if isinstance(folder, str)
+        }
 
         return True
 
     def update_config(self):
-        """Update config from str."""
+        """Persist bot settings, including the last custom destination."""
         self.config["download_filter"] = self.download_filter
-
-        with open("d", "w", encoding="utf-8") as yaml_file:
+        self.config["last_custom_download_folders"] = self.last_custom_download_folders
+        with open(self.config_path, "w", encoding="utf-8") as yaml_file:
             self._yaml.dump(self.config, yaml_file)
 
     async def start(
@@ -1101,16 +1111,63 @@ async def _send_browser_file(
 
 
 def _clean_custom_folder(folder: str) -> str:
-    """Return a safe path below the configured download root."""
-    folder = folder.strip()
-    if not folder or os.path.isabs(folder):
-        raise ValueError("folder must be a non-empty relative path")
-    normalized = os.path.normpath(folder)
-    if normalized in (".", "..") or normalized.startswith(".." + os.sep):
-        raise ValueError("folder must not leave the download directory")
-    if any(part == ".." for part in normalized.replace("\\", "/").split("/")):
-        raise ValueError("folder must not contain '..'")
-    return normalized
+    """Return one safe folder name below the configured download root."""
+    name = folder.strip()
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+    ):
+        raise ValueError("folder must be a single non-empty name")
+    return name
+
+
+def _existing_custom_folders() -> list:
+    """List direct child folders that can be selected as custom destinations."""
+    root = _download_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        (entry.name for entry in os.scandir(root) if entry.is_dir()),
+        key=str.casefold,
+    )
+
+
+def _folder_button_label(prefix: str, folder: str) -> str:
+    """Keep inline-button text readable and below Telegram's limit."""
+    return prefix + (folder if len(folder) <= 40 else folder[:39] + "…")
+
+
+def _existing_folder_keyboard(token: str, page: int) -> InlineKeyboardMarkup:
+    """Build a paginated picker for every direct child folder of downloads/."""
+    folders = _existing_custom_folders()
+    per_page = 20
+    page_count = max(1, (len(folders) + per_page - 1) // per_page)
+    page = max(0, min(page, page_count - 1))
+    start = page * per_page
+    buttons = [
+        [
+            InlineKeyboardButton(
+                _folder_button_label("📁 ", folder),
+                callback_data=f"dest_existing_select:{token}:{index}",
+            )
+        ]
+        for index, folder in enumerate(folders[start : start + per_page], start)
+    ]
+    if page_count > 1:
+        navigation = []
+        if page:
+            navigation.append(
+                InlineKeyboardButton("‹ 上一页", callback_data=f"dest_existing_page:{token}:{page - 1}")
+            )
+        if page < page_count - 1:
+            navigation.append(
+                InlineKeyboardButton("下一页 ›", callback_data=f"dest_existing_page:{token}:{page + 1}")
+            )
+        buttons.append(navigation)
+    return InlineKeyboardMarkup(buttons)
 
 
 async def _ask_download_folder(pending: PendingDirectDownload):
@@ -1132,26 +1189,33 @@ async def _ask_download_folder(pending: PendingDirectDownload):
     pending.messages = [unique[key] for key in sorted(unique)]
     _bot.handled_media_groups[pending.key] = True
     count = len(pending.messages)
+    last_folder = _bot.last_custom_download_folders.get(str(pending.user_id))
+    last_label = (
+        _folder_button_label("🕘 上次：", last_folder)
+        if last_folder
+        else "🕘 上次自定义（无）"
+    )
     prompt = await pending.client.send_message(
         pending.user_id,
         f"📦 检测到 {count} 个媒体文件。\n"
         "请选择保存位置：\n"
         "默认目录会保持当前频道/日期分类规则；自定义目录会创建在 downloads/ 下。",
-        reply_to_message_id=first.id,
+        reply_to_message_id=pending.reply_to_message_id or first.id,
         reply_markup=InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
                         "✅ 默认目录", callback_data=f"dest_default:{pending.token}"
                     ),
-                    InlineKeyboardButton(
-                        "📁 自定义文件夹", callback_data=f"dest_custom:{pending.token}"
-                    ),
+                    InlineKeyboardButton(last_label, callback_data=f"dest_last:{pending.token}"),
                 ],
                 [
                     InlineKeyboardButton(
-                        "❌ 取消", callback_data=f"dest_cancel:{pending.token}"
-                    )
+                        "📂 已有文件夹", callback_data=f"dest_existing:{pending.token}"
+                    ),
+                    InlineKeyboardButton(
+                        "📁 新建文件夹", callback_data=f"dest_custom:{pending.token}"
+                    ),
                 ],
             ]
         ),
@@ -1175,6 +1239,7 @@ async def collect_direct_download(client: pyrogram.Client, message: pyrogram.typ
             key=key,
             user_id=message.from_user.id,
             client=client,
+            reply_to_message_id=message.id,
         )
         _bot.pending_direct_downloads[key] = pending
     pending.messages.append(message)
@@ -1215,13 +1280,15 @@ async def _start_pending_download(pending: PendingDirectDownload, folder: str = 
                 pending.user_id,
                 thumb_id,
                 caption=initial,
-                reply_to_message_id=first.id,
+                reply_to_message_id=pending.reply_to_message_id or first.id,
             )
     except Exception:
         progress_message = None
     if not progress_message:
         progress_message = await pending.client.send_message(
-            pending.user_id, initial, reply_to_message_id=first.id
+            pending.user_id,
+            initial,
+            reply_to_message_id=pending.reply_to_message_id or first.id,
         )
 
     node = TaskNode(
@@ -1280,15 +1347,38 @@ async def receive_custom_download_folder(
     except (ValueError, OSError):
         await client.send_message(
             pending.user_id,
-            "文件夹无效。请回复相对路径，例如：课程/Python 第一季；或回复 /cancel。",
+            "文件夹名称无效。请输入单个文件夹名，例如：玉川；或回复 /cancel。",
             reply_to_message_id=pending.prompt_message_id,
         )
         return
 
+    _bot.last_custom_download_folders[str(pending.user_id)] = relative
+    try:
+        _bot.update_config()
+    except OSError as exc:
+        logger.warning(f"Could not save last custom download folder: {exc}")
     await client.edit_message_text(
         pending.user_id, pending.prompt_message_id, f"📁 保存到：{relative}"
     )
     await _start_pending_download(pending, folder)
+
+
+async def ask_link_download_folder(
+    client: pyrogram.Client,
+    request_message: pyrogram.types.Message,
+    download_messages: List[pyrogram.types.Message],
+):
+    """Show the same destination picker for media resolved from a link."""
+    _bot.pending_download_seq += 1
+    pending = PendingDirectDownload(
+        token=str(_bot.pending_download_seq),
+        key=f"link-{request_message.from_user.id}-{request_message.id}",
+        user_id=request_message.from_user.id,
+        client=client,
+        messages=download_messages,
+        reply_to_message_id=request_message.id,
+    )
+    await _ask_download_folder(pending)
 
 
 async def direct_download(
@@ -1426,7 +1516,7 @@ async def download_from_link(client: pyrogram.Client, message: pyrogram.types.Me
                             download_messages = album
                     except Exception as exc:
                         logger.warning("Unable to fetch media album: {}", exc)
-                await direct_download(_bot, entity.id, message, download_messages)
+                await ask_link_download_folder(client, message, download_messages)
             else:
                 client.send_message(
                     message.from_user.id,
@@ -2032,7 +2122,8 @@ async def on_query_handler(
         return
 
     if query.data.startswith("dest_"):
-        action, token = query.data.split(":", 1)
+        parts = query.data.split(":")
+        action, token = parts[0], parts[1]
         pending = next(
             (
                 value
@@ -2049,13 +2140,62 @@ async def on_query_handler(
             await client.edit_message_text(pending.user_id, pending.prompt_message_id, "❌ 已取消下载")
             await query.answer()
             return
+        if action == "dest_last":
+            relative = _bot.last_custom_download_folders.get(str(pending.user_id))
+            if not relative:
+                await query.answer("还没有使用过自定义文件夹", show_alert=True)
+                return
+            folder = os.path.join(_download_root(), relative)
+            if not os.path.isdir(folder):
+                await query.answer("上次的文件夹已不存在", show_alert=True)
+                return
+            await client.edit_message_text(
+                pending.user_id, pending.prompt_message_id, f"📁 保存到：{relative}"
+            )
+            await _start_pending_download(pending, folder)
+            await query.answer()
+            return
+        if action in ("dest_existing", "dest_existing_page"):
+            folders = _existing_custom_folders()
+            if not folders:
+                await query.answer("downloads 下还没有已有文件夹", show_alert=True)
+                return
+            try:
+                page = int(parts[2]) if action == "dest_existing_page" else 0
+            except (IndexError, ValueError):
+                page = 0
+            await client.edit_message_text(
+                pending.user_id,
+                pending.prompt_message_id,
+                "请选择已有文件夹：",
+                reply_markup=_existing_folder_keyboard(pending.token, page),
+            )
+            await query.answer()
+            return
+        if action == "dest_existing_select":
+            try:
+                folder_name = _existing_custom_folders()[int(parts[2])]
+            except (IndexError, ValueError):
+                await query.answer("文件夹列表已更新，请重新选择", show_alert=True)
+                return
+            folder = os.path.join(_download_root(), folder_name)
+            _bot.last_custom_download_folders[str(pending.user_id)] = folder_name
+            try:
+                _bot.update_config()
+            except OSError as exc:
+                logger.warning(f"Could not save last custom download folder: {exc}")
+            await client.edit_message_text(
+                pending.user_id, pending.prompt_message_id, f"📁 保存到：{folder_name}"
+            )
+            await _start_pending_download(pending, folder)
+            await query.answer()
+            return
         if action == "dest_custom":
             pending.waiting_custom_path = True
             await client.edit_message_text(
                 pending.user_id,
                 pending.prompt_message_id,
-                "请回复此消息输入文件夹名称。\n"
-                "例如：课程/Python 第一季\n"
+                "请输入文件夹名称，例如：玉川。\n"
                 "文件夹会创建在 downloads/ 下；回复 /cancel 可取消。",
             )
             await query.answer()

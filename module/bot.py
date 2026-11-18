@@ -296,6 +296,18 @@ class DownloadBot:
         )
         self.bot.add_handler(
             MessageHandler(
+                keyboard_command,
+                filters=pyrogram.filters.regex(
+                    r"^(⬇️ 下载消息|📁 浏览文件|💾 存储空间|↗️ 转发消息|"
+                    r"🔎 链接信息|👂 监听转发|💬 转发评论|🌐 设置语言|"
+                    r"⛔ 停止任务|❓ 帮助|🛡 添加过滤|🏠 首页)$"
+                )
+                & pyrogram.filters.user(self.allowed_user_ids),
+            ),
+            group=0,
+        )
+        self.bot.add_handler(
+            MessageHandler(
                 set_listen_forward_msg,
                 filters=pyrogram.filters.command(["listen_forward"])
                 & pyrogram.filters.user(self.allowed_user_ids),
@@ -412,10 +424,10 @@ def _command_keyboard():
     """Persistent three-column command keyboard shown below the input field."""
     return types.ReplyKeyboardMarkup(
         [
-            ["/download", "/files", "/storage"],
-            ["/forward", "/get_info", "/listen_forward"],
-            ["/forward_to_comments", "/set_language", "/stop"],
-            ["/help", "/add_filter", "/start"],
+            ["⬇️ 下载消息", "📁 浏览文件", "💾 存储空间"],
+            ["↗️ 转发消息", "🔎 链接信息", "👂 监听转发"],
+            ["💬 转发评论", "🌐 设置语言", "⛔ 停止任务"],
+            ["❓ 帮助", "🛡 添加过滤", "🏠 首页"],
         ],
         resize_keyboard=True,
     )
@@ -440,16 +452,42 @@ async def storage_status(client: pyrogram.Client, message: pyrogram.types.Messag
         None, _directory_size, library_path
     )
     disk = shutil.disk_usage(library_path)
+    # ``free`` is what the container can really write.  ``total - used`` also
+    # includes filesystem-reserved blocks, so expose both instead of hiding it.
+    remaining = disk.total - disk.used
+    reserved = remaining - disk.free
     await client.send_message(
         message.chat.id,
         "💾 存储空间\n\n"
         f"📂 下载视频库  {format_byte(library_size)}\n\n"
         f"🖥 VPS 硬盘  总容量：{format_byte(disk.total)}\n"
         f"🗂 已使用：{format_byte(disk.used)}\n"
-        f"🟢 剩余空间：{format_byte(disk.free)} · "
-        f"{disk.free / disk.total * 100:.1f}%",
+        f"🟢 剩余空间：{format_byte(remaining)}\n"
+        f"✍️ 可实际写入：{format_byte(disk.free)}\n"
+        f"⚙️ 系统保留：{format_byte(reserved)}",
         reply_markup=_command_keyboard(),
     )
+
+
+async def keyboard_command(client: pyrogram.Client, message: pyrogram.types.Message):
+    """Run the action selected from the Chinese reply keyboard."""
+    actions = {
+        "⬇️ 下载消息": download_from_bot,
+        "📁 浏览文件": browse_files,
+        "💾 存储空间": storage_status,
+        "↗️ 转发消息": forward_messages,
+        "🔎 链接信息": get_info,
+        "👂 监听转发": set_listen_forward_msg,
+        "💬 转发评论": forward_to_comments,
+        "🌐 设置语言": set_language,
+        "⛔ 停止任务": stop,
+        "❓ 帮助": help_command,
+        "🛡 添加过滤": add_filter,
+        "🏠 首页": help_command,
+    }
+    action = actions.get(message.text)
+    if action:
+        await action(client, message)
 
 
 async def send_help_str(client: pyrogram.Client, chat_id):
